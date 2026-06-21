@@ -1,0 +1,12 @@
+# Extra non-public seeds for local robustness checks.
+batch: 640; n: 512; cond: 2; seed: 1
+batch: 640; n: 512; cond: 2; seed: 2
+batch: 640; n: 512; cond: 2; seed: 3
+batch: 640; n: 512; cond: 2; seed: 4; case: mixed
+batch: 640; n: 512; cond: 0; seed: 5; case: rankdef
+batch: 640; n: 512; cond: 0; seed: 6; case: clustered
+batch: 60; n: 1024; cond: 2; seed: 7; case: mixed
+batch: 60; n: 1024; cond: 0; seed: 8; case: nearrank
+batch: 16; n: 512; cond: 0; seed: 9; case: rowscale
+batch: 16; n: 512; cond: 0; seed: 10; case: nearcollinear
+batch: 16; n: 512; cond: 0; seed: 11; case: band

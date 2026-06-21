@@ -1,0 +1,47 @@
+AGENTS.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+
+# CUDA / profiling artifacts
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+*.nsys-rep
+*.sqlite
+
+# Local run outputs
+results/*.jsonl
+!results/runs.jsonl
+results/*.log
+!results/.gitkeep
+
+# Local machine files
+.DS_Store
+.env
+.env.*
+
+# Dump scripts and output
+dump_python_files.sh
+python_files_dump.txt

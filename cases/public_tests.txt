@@ -1,0 +1,22 @@
+batch: 20; n: 32; cond: 1; seed: 53124
+batch: 40; n: 176; cond: 1; seed: 3321
+batch: 40; n: 352; cond: 1; seed: 1200
+batch: 16; n: 512; cond: 2; seed: 32523
+batch: 4; n: 1024; cond: 2; seed: 4327
+batch: 1; n: 4096; cond: 1; seed: 75342
+batch: 16; n: 512; cond: 4; seed: 32524; case: dense
+batch: 16; n: 512; cond: 0; seed: 32525; case: rankdef
+batch: 16; n: 512; cond: 0; seed: 32526; case: clustered
+batch: 16; n: 512; cond: 0; seed: 32527; case: band
+batch: 16; n: 512; cond: 0; seed: 32528; case: rowscale
+batch: 16; n: 512; cond: 0; seed: 32529; case: nearcollinear
+batch: 4; n: 1024; cond: 4; seed: 4328; case: dense
+batch: 4; n: 1024; cond: 0; seed: 4329; case: rankdef
+batch: 4; n: 1024; cond: 0; seed: 4330; case: nearrank
+batch: 4; n: 1024; cond: 0; seed: 4331; case: clustered
+batch: 2; n: 2048; cond: 2; seed: 224466; case: dense
+batch: 2; n: 2048; cond: 0; seed: 224467; case: rankdef
+batch: 1; n: 4096; cond: 0; seed: 75343; case: upper
+batch: 16; n: 512; cond: 2; seed: 32530; case: mixed
+batch: 4; n: 1024; cond: 2; seed: 4332; case: mixed
+batch: 2; n: 2048; cond: 2; seed: 224468; case: mixed
