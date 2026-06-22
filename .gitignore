@@ -32,10 +32,9 @@ dist/
 *.sqlite
 
 # Local run outputs
-results/*.jsonl
-!results/runs.jsonl
-results/*.log
+results/*
 !results/.gitkeep
+!results/runs.jsonl
 
 # Local machine files
 .DS_Store

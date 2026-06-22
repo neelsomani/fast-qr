@@ -17,9 +17,11 @@ from qr_common import (
     clone_data,
     ensure_official_on_path,
     environment_info,
+    file_provenance,
     load_cases,
     load_submission,
     require_cuda,
+    relative_path,
 )
 
 
@@ -127,6 +129,23 @@ def run_leaderboard_warmup(custom_kernel, cases: list[dict]) -> None:
             raise RuntimeError(f"leaderboard warmup failed for {spec}: {result['error']}")
 
 
+def parse_indices(raw: str, count: int) -> list[int]:
+    if not raw:
+        return list(range(count))
+    indexes = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        index = int(token)
+        if index < 0 or index >= count:
+            raise ValueError(f"case index {index} out of range for {count} cases")
+        indexes.append(index)
+    if not indexes:
+        raise ValueError("no case indexes selected")
+    return indexes
+
+
 def summarize(results: list[dict]) -> dict:
     valid = [result for result in results if result.get("ok")]
     geomean = math.exp(sum(math.log(result["mean_us"]) for result in valid) / len(valid))
@@ -140,6 +159,7 @@ def main() -> int:
     )
     parser.add_argument("--submission", required=True, help="Path to a submission.py-compatible file.")
     parser.add_argument("--cases", default="cases/public_benchmarks.txt", help="Case file to run.")
+    parser.add_argument("--indices", default="", help="Comma-separated case indexes. Defaults to all cases.")
     parser.add_argument("--repeats", type=int, default=5, help="Timed repeats per case.")
     parser.add_argument(
         "--popcorn-seed",
@@ -176,17 +196,24 @@ def main() -> int:
         require_cuda(torch)
     except RuntimeError as exc:
         parser.error(str(exc))
-    custom_kernel = load_submission(args.submission)
-    cases = apply_popcorn_seed(
-        load_cases(ROOT / args.cases if not Path(args.cases).is_absolute() else args.cases),
-        args.popcorn_seed,
-    )
+    submission_path = ROOT / args.submission if not Path(args.submission).is_absolute() else Path(args.submission)
+    custom_kernel = load_submission(submission_path)
+    all_cases = load_cases(ROOT / args.cases if not Path(args.cases).is_absolute() else args.cases)
+    try:
+        indexes = parse_indices(args.indices, len(all_cases))
+    except ValueError as exc:
+        parser.error(str(exc))
+    selected_cases = apply_popcorn_seed([all_cases[index] for index in indexes], args.popcorn_seed)
+    cases = list(zip(indexes, selected_cases))
     if args.leaderboard_warmup:
-        run_leaderboard_warmup(custom_kernel, cases)
+        run_leaderboard_warmup(custom_kernel, [spec for _, spec in cases])
 
     env = environment_info(torch) if args.record_env else {}
+    if args.record_env:
+        env["submission"] = relative_path(submission_path)
+        env["submission_sha256"] = file_provenance(submission_path)["sha256"]
     results: list[dict] = []
-    for spec in cases:
+    for case_index, spec in cases:
         result = run_one(
             custom_kernel,
             spec,
@@ -195,6 +222,7 @@ def main() -> int:
             official_stopping=args.official_stopping,
             max_time_ns=args.max_time_ns,
         )
+        result["case_index"] = case_index
         if env:
             result = {**env, **result}
         print(json.dumps(result, sort_keys=True), flush=True)

@@ -15,6 +15,8 @@ from qr_common import (
     append_jsonl,
     apply_popcorn_seed,
     ensure_official_on_path,
+    environment_info,
+    file_provenance,
     format_case,
     load_cases,
     load_submission,
@@ -167,6 +169,8 @@ def experiment_tail_delete(data: torch.Tensor, spec: dict[str, Any], cuts: list[
     n = data.shape[-1]
     rows = []
     for cut in cuts:
+        if cut >= n:
+            continue
         keep = max(0, n - cut)
         tau2 = tau.clone()
         if keep < n:
@@ -304,9 +308,16 @@ def main() -> int:
     parser.add_argument("--experiments", default=",".join(DEFAULT_EXPERIMENTS))
     parser.add_argument("--tail-cuts", default="0,8,16,32,64,128")
     parser.add_argument("--out", default=None, help="Append JSONL rows to this path.")
+    parser.add_argument("--record-env", action="store_true", help="Include repo, torch/CUDA, and submission provenance.")
     args = parser.parse_args()
 
-    custom_kernel = load_submission(ROOT / args.submission if not Path(args.submission).is_absolute() else args.submission)
+    submission = ROOT / args.submission if not Path(args.submission).is_absolute() else Path(args.submission)
+    custom_kernel = load_submission(submission)
+    env = environment_info(torch) if args.record_env else {}
+    if args.record_env:
+        provenance = file_provenance(submission)
+        env["submission"] = provenance["path"]
+        env["submission_sha256"] = provenance["sha256"]
     experiments = parse_experiments(args.experiments)
     tail_cuts = [int(value) for value in args.tail_cuts.split(",") if value.strip()]
 
@@ -330,6 +341,9 @@ def main() -> int:
             rows.extend(experiment_identity_q(data, spec))
         if "classify" in experiments:
             rows.extend(experiment_classify(data, spec))
+
+    if env:
+        rows = [{**env, **row} for row in rows]
 
     for row in rows:
         print(json.dumps(row, sort_keys=True), flush=True)
