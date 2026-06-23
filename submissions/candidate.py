@@ -1295,7 +1295,8 @@ void geqrf512_blocked_auto_workspace(
     torch::Tensor h,
     torch::Tensor tau,
     torch::Tensor factor_cols,
-    torch::Tensor project_tail
+    torch::Tensor project_tail,
+    torch::Tensor has_structured
 );
 
 void geqrf512_blocked_make_policy_cuda(
@@ -1553,6 +1554,7 @@ constexpr int PANEL_REFRESH_PERIOD = __PANEL_REFRESH_PERIOD__;
 constexpr int R_MAINTENANCE_PERIOD = __R_MAINTENANCE_PERIOD__;
 constexpr int SYNC_FREE_AUTO_POLICY = __SYNC_FREE_AUTO_POLICY__;
 constexpr int USE_FULL_POLICY_SCAN = __USE_FULL_POLICY_SCAN__;
+constexpr int POLICY_RANDOM_ROWS = __POLICY_RANDOM_ROWS__;
 constexpr int CTA_SCHEDULE_FRONTLOAD = __CTA_SCHEDULE_FRONTLOAD__;
 constexpr int CTA_SCHEDULE_ALL_TILES = __CTA_SCHEDULE_ALL_TILES__;
 constexpr float POLICY_SCALED_TAIL_RATIO = __POLICY_SCALED_TAIL_RATIO__;
@@ -1829,7 +1831,6 @@ __global__ void __launch_bounds__(BLOCK_THREADS) blocked512_policy_kernel(
     constexpr int CLUSTER_HEAD_COLS = CLUSTERED_COLS / 2;
     constexpr int TAIL_COLS = N - RANK_COLS;
     constexpr int POLICY_SAMPLE_OFFSETS = 4;
-    constexpr int POLICY_RANDOM_ROWS = __POLICY_RANDOM_ROWS__;
     constexpr float CLUSTERED_THRESHOLD = 1.0e-4f;
     constexpr float NEARRANK_THRESHOLD = 1.0e-3f;
 

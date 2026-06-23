@@ -5333,6 +5333,17 @@ def test_candidate_blocked_cuda_update_col_end_is_on_trailing_kernel_signature()
         assert f"void geqrf{n}_blocked_auto_cuda(" in cpp_source
         assert f"void geqrf{n}_blocked_auto(" in cpp_source
         assert f"void geqrf{n}_blocked_auto_workspace(" in cpp_source
+        assert re.search(
+            rf"void geqrf{n}_blocked_auto_workspace\(\s*"
+            r"torch::Tensor data,\s*"
+            r"torch::Tensor h,\s*"
+            r"torch::Tensor tau,\s*"
+            r"torch::Tensor factor_cols,\s*"
+            r"torch::Tensor project_tail,\s*"
+            r"torch::Tensor has_structured\s*\);",
+            cpp_source,
+            re.S,
+        )
         assert f"void geqrf{n}_blocked_make_policy_cuda(" in cpp_source
         assert f"void geqrf{n}_blocked_make_policy_workspace_cuda(" in cpp_source
         assert f"void geqrf{n}_blocked_make_policy(" in cpp_source
@@ -5508,6 +5519,7 @@ def test_candidate_blocked_cuda_update_col_end_is_on_trailing_kernel_signature()
         else:
             expected_policy_rows = candidate._generic_blocked_cuda_policy_sample_rows(n)
         assert f"constexpr int POLICY_RANDOM_ROWS = {expected_policy_rows};" in source
+        assert source.index("constexpr int POLICY_RANDOM_ROWS") < source.index(f"blocked{n}_dense_tail_allowed(")
         assert "const int row = (row_slot == 0) ? tail_col" in policy_body
         assert "const int head_col = offset;" in policy_body
         assert "const int tail_col = RANK_COLS + offset;" in policy_body
