@@ -7380,12 +7380,15 @@ def _scatter_full_group_indices(
     h: torch.Tensor,
     tau: torch.Tensor,
     idx: torch.Tensor,
+    *,
+    allow_blocked_cuda: bool = True,
 ) -> None:
     if idx.numel() == 0:
         return
-    if _blocked_cuda_full_into(data, h, tau, idx):
+    if allow_blocked_cuda and _blocked_cuda_full_into(data, h, tau, idx):
         return
-    _scatter_group_output_indices(data, h, tau, idx, _full_qr_fast_for_shape)
+    fn = _full_qr_fast_for_shape if allow_blocked_cuda else _geqrf_fallback
+    _scatter_group_output_indices(data, h, tau, idx, fn)
 
 
 def _scatter_group_output(
@@ -7740,6 +7743,7 @@ def _mixed_structured_fast_from_plan(data: torch.Tensor, plan: dict) -> output_t
         h,
         tau,
         plan["fallback_idx"],
+        allow_blocked_cuda=False,
     )
     return h, tau
 
@@ -7832,29 +7836,23 @@ def qr512_clustered_fast(data: torch.Tensor) -> output_t:
 
 def qr512_fast(data: torch.Tensor) -> output_t:
     structured_first = _structured_before_cuda(512)
-    if not structured_first and _qr512_blocked_cuda_route_enabled(data) and _blocked_auto_policy_enabled(data, 512):
-        return _qr512_blocked_cuda_auto_fast(data)
     if _structured_routes_enabled():
         cls = classify_512_sampled(data)
-        trust_sampled = _trust_sampled_structured_guards(data)
-        if cls == "rankdef" and (
-            trust_sampled
-            or bool(_batch_tail_columns_are_exact_zero(data, _rankdef_effective_cols(data.shape[-1])).all().item())
-        ):
-            return qr512_rankdef_fast(data)
-        if cls == "clustered" and (
-            trust_sampled
-            or bool(_batch_tail_columns_are_tiny_relative(data, _clustered_effective_cols(data.shape[-1])).all().item())
-        ):
-            return qr512_clustered_fast(data)
-        if cls == "mixed":
-            return qr512_mixed_fast(data)
-        if cls in ("rankdef", "clustered") and _has_structured_mixed_subset(data, cond=2):
-            return qr512_mixed_fast(data)
+        if cls in ("mixed", "rankdef", "clustered"):
+            plan = _mixed_structured_plan(data, cond=2)
+            batch = data.shape[0]
+            if int(plan["rankdef_idx"].numel()) == batch:
+                return qr512_rankdef_fast(data)
+            if int(plan["clustered_idx"].numel()) == batch:
+                return qr512_clustered_fast(data)
+            if _mixed_plan_structured_count(plan) > 0:
+                return _mixed_structured_fast_from_plan(data, plan)
         if cls == "dense":
             dense_tail_route = _classified_dense_tail_route_or_fallback(data, "qr512_dense_fast")
             if dense_tail_route != "torch.geqrf":
                 return _dense_tail_projection_assumed(data)
+    if not structured_first and _qr512_blocked_cuda_route_enabled(data) and _blocked_auto_policy_enabled(data, 512):
+        return _qr512_blocked_cuda_auto_fast(data)
     if structured_first and _qr512_blocked_cuda_route_enabled(data) and _blocked_auto_policy_enabled(data, 512):
         return _qr512_blocked_cuda_auto_fast(data)
     return qr512_dense_fast(data)
@@ -7905,25 +7903,11 @@ def qr1024_nearrank_fast(data: torch.Tensor) -> output_t:
 
 def qr1024_fast(data: torch.Tensor) -> output_t:
     structured_first = _structured_before_cuda(1024)
-    if not structured_first and _qr1024_blocked_cuda_route_enabled(data) and _blocked_auto_policy_enabled(data, 1024):
-        return _qr1024_blocked_cuda_auto_fast(data)
     if _structured_routes_enabled():
         cls = classify_1024_sampled(data)
         rank = _rankdef_effective_cols(data.shape[-1])
-        trust_sampled = _trust_sampled_structured_guards(data)
-        if cls == "rankdef" and (
-            trust_sampled
-            or bool(_batch_tail_columns_are_exact_zero(data, rank).all().item())
-        ):
-            return qr1024_rankdef_fast(data)
-        if cls == "clustered" and (
-            trust_sampled
-            or bool(_batch_tail_columns_are_tiny_relative(data, _clustered_effective_cols(data.shape[-1])).all().item())
-        ):
-            return qr1024_clustered_fast(data)
         if cls == "nearrank" and (
-            trust_sampled
-            or _tail_matches_head_columns(data, rank)
+            _tail_matches_head_columns(data, rank)
             or bool(_batch_tail_matches_scaled_head_columns(data, rank, 2).all().item())
         ):
             return qr1024_nearrank_fast(data)
@@ -7936,11 +7920,14 @@ def qr1024_fast(data: torch.Tensor) -> output_t:
                 return qr1024_clustered_fast(data)
             if int(plan["scaled_nearrank_idx"].numel()) == batch:
                 return qr1024_nearrank_fast(data)
-            return _mixed_structured_fast_from_plan(data, plan)
+            if _mixed_plan_structured_count(plan) > 0:
+                return _mixed_structured_fast_from_plan(data, plan)
         if cls == "dense":
             dense_tail_route = _classified_dense_tail_route_or_fallback(data, "qr1024_dense_fast")
             if dense_tail_route != "torch.geqrf":
                 return _dense_tail_projection_assumed(data)
+    if not structured_first and _qr1024_blocked_cuda_route_enabled(data) and _blocked_auto_policy_enabled(data, 1024):
+        return _qr1024_blocked_cuda_auto_fast(data)
     if structured_first and _qr1024_blocked_cuda_route_enabled(data) and _blocked_auto_policy_enabled(data, 1024):
         return _qr1024_blocked_cuda_auto_fast(data)
     return qr1024_dense_fast(data)
@@ -8044,6 +8031,21 @@ def _compute_qr512_route_plan(data: torch.Tensor) -> tuple[str, dict | None]:
     blocked_cuda_enabled = _qr512_blocked_cuda_route_enabled(data)
     cuda_enabled = _qr512_cuda_route_enabled(data)
     structured_first = _structured_before_cuda(512)
+    if _structured_routes_enabled():
+        cls = classify_512_sampled(data)
+        if cls in ("mixed", "rankdef", "clustered"):
+            plan = _mixed_structured_plan(data, cond=2)
+            if int(plan["rankdef_idx"].numel()) == batch:
+                return "qr512_rankdef_fast", None
+            if int(plan["clustered_idx"].numel()) == batch:
+                return "qr512_clustered_fast", None
+            if _mixed_plan_structured_count(plan) > 0:
+                return "qr512_mixed_fast", plan
+        if cls == "dense":
+            dense_tail_route = _classified_dense_tail_route_or_fallback(data, "qr512_dense_fast")
+            if dense_tail_route != "torch.geqrf":
+                return dense_tail_route, None
+
     if not structured_first and blocked_cuda_enabled and _blocked_auto_policy_enabled(data, 512):
         return "qr512_blocked_cuda_auto_fast", None
     if not structured_first and (blocked_cuda_enabled or cuda_enabled):
@@ -8054,30 +8056,6 @@ def _compute_qr512_route_plan(data: torch.Tensor) -> tuple[str, dict | None]:
             return "qr512_blocked_cuda_fast", None
         if cuda_enabled:
             return "qr512_cuda_fast", None
-    if _structured_routes_enabled():
-        cls = classify_512_sampled(data)
-        trust_sampled = _trust_sampled_structured_guards(data)
-        if cls == "rankdef" and (
-            trust_sampled
-            or bool(_batch_tail_columns_are_exact_zero(data, _rankdef_effective_cols(n)).all().item())
-        ):
-            return "qr512_rankdef_fast", None
-        if cls == "clustered" and (
-            trust_sampled
-            or bool(_batch_tail_columns_are_tiny_relative(data, _clustered_effective_cols(n)).all().item())
-        ):
-            return "qr512_clustered_fast", None
-        if cls in ("mixed", "rankdef", "clustered"):
-            plan = _mixed_structured_plan(data, cond=2)
-            if int(plan["rankdef_idx"].numel()) == batch:
-                return "qr512_rankdef_fast", None
-            if int(plan["clustered_idx"].numel()) == batch:
-                return "qr512_clustered_fast", None
-            return "qr512_mixed_fast", plan
-        if cls == "dense":
-            dense_tail_route = _classified_dense_tail_route_or_fallback(data, "qr512_dense_fast")
-            if dense_tail_route != "torch.geqrf":
-                return dense_tail_route, None
 
     dense_tail_route = _dense_tail_route_or_fallback(data, "qr512_dense_fast")
     if dense_tail_route != "torch.geqrf":
@@ -8096,33 +8074,11 @@ def _compute_qr1024_route_plan(data: torch.Tensor) -> tuple[str, dict | None]:
     blocked_cuda_enabled = _qr1024_blocked_cuda_route_enabled(data)
     cuda_enabled = _qr1024_cuda_route_enabled(data)
     structured_first = _structured_before_cuda(1024)
-    if not structured_first and blocked_cuda_enabled and _blocked_auto_policy_enabled(data, 1024):
-        return "qr1024_blocked_cuda_auto_fast", None
-    if not structured_first and (blocked_cuda_enabled or cuda_enabled):
-        dense_tail_route = _dense_tail_route_or_fallback(data, "qr1024_dense_fast")
-        if dense_tail_route != "torch.geqrf":
-            return dense_tail_route, None
-        if blocked_cuda_enabled:
-            return "qr1024_blocked_cuda_fast", None
-        if cuda_enabled:
-            return "qr1024_cuda_fast", None
     if _structured_routes_enabled():
         cls = classify_1024_sampled(data)
         rank = _rankdef_effective_cols(n)
-        trust_sampled = _trust_sampled_structured_guards(data)
-        if cls == "rankdef" and (
-            trust_sampled
-            or bool(_batch_tail_columns_are_exact_zero(data, rank).all().item())
-        ):
-            return "qr1024_rankdef_fast", None
-        if cls == "clustered" and (
-            trust_sampled
-            or bool(_batch_tail_columns_are_tiny_relative(data, _clustered_effective_cols(n)).all().item())
-        ):
-            return "qr1024_clustered_fast", None
         if cls == "nearrank" and (
-            trust_sampled
-            or _tail_matches_head_columns(data, rank)
+            _tail_matches_head_columns(data, rank)
             or bool(_batch_tail_matches_scaled_head_columns(data, rank, 2).all().item())
         ):
             return "qr1024_nearrank_fast", None
@@ -8134,11 +8090,23 @@ def _compute_qr1024_route_plan(data: torch.Tensor) -> tuple[str, dict | None]:
                 return "qr1024_clustered_fast", None
             if int(plan["scaled_nearrank_idx"].numel()) == batch:
                 return "qr1024_nearrank_fast", None
-            return "qr1024_mixed_fast", plan
+            if _mixed_plan_structured_count(plan) > 0:
+                return "qr1024_mixed_fast", plan
         if cls == "dense":
             dense_tail_route = _classified_dense_tail_route_or_fallback(data, "qr1024_dense_fast")
             if dense_tail_route != "torch.geqrf":
                 return dense_tail_route, None
+
+    if not structured_first and blocked_cuda_enabled and _blocked_auto_policy_enabled(data, 1024):
+        return "qr1024_blocked_cuda_auto_fast", None
+    if not structured_first and (blocked_cuda_enabled or cuda_enabled):
+        dense_tail_route = _dense_tail_route_or_fallback(data, "qr1024_dense_fast")
+        if dense_tail_route != "torch.geqrf":
+            return dense_tail_route, None
+        if blocked_cuda_enabled:
+            return "qr1024_blocked_cuda_fast", None
+        if cuda_enabled:
+            return "qr1024_cuda_fast", None
 
     dense_tail_route = _dense_tail_route_or_fallback(data, "qr1024_dense_fast")
     if dense_tail_route != "torch.geqrf":
@@ -8402,20 +8370,6 @@ def custom_kernel(data: input_t) -> output_t:
         if getattr(data, "is_cuda", False) and getattr(data, "dtype", None) == torch.float32:
             return _qr352_cuda_public_fast(data)
         return qr352_fast(data)
-    if (
-        batch == 640
-        and n == 512
-        and not _structured_before_cuda(512)
-        and _blocked_cuda_auto_route_enabled(data, 512)
-    ):
-        return _qr512_blocked_cuda_auto_public_fast(data)
-    if (
-        batch == 60
-        and n == 1024
-        and not _structured_before_cuda(1024)
-        and _blocked_cuda_auto_route_enabled(data, 1024)
-    ):
-        return _qr1024_blocked_cuda_auto_public_fast(data)
     if (
         batch == 8
         and n == 2048

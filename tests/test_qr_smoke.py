@@ -3897,25 +3897,32 @@ def test_route_trace_marks_dense_fallthrough_classifier_hot_path():
     assert row1024["cuda_route_bypasses_classifier"] is False
 
 
-def test_structured_before_cuda_changes_qr512_route_order(monkeypatch):
+def test_qr512_structured_cases_preempt_cuda_route_order(monkeypatch):
     candidate = _load_candidate_module()
     fake_data = SimpleNamespace(shape=(640, 512, 512))
-
-    class TrueLike:
-        def all(self):
-            return self
-
-        def item(self):
-            return True
 
     monkeypatch.delenv("FAST_QR_QR512_STRUCTURED_BEFORE_CUDA", raising=False)
     monkeypatch.delenv("FAST_QR_STRUCTURED_ROUTES_BEFORE_CUDA", raising=False)
     monkeypatch.setenv("FAST_QR_DENSE_TAIL_CUT_512", "0")
     monkeypatch.setattr(candidate, "_qr512_cuda_route_enabled", lambda _data: True)
     monkeypatch.setattr(candidate, "classify_512_sampled", lambda _data: "rankdef")
-    monkeypatch.setattr(candidate, "_batch_tail_columns_are_exact_zero", lambda _data, _rank: TrueLike())
 
-    assert candidate._compute_route_plan(fake_data)[0] == "qr512_cuda_fast"
+    def rankdef_plan(data, cond=2):
+        empty = torch.empty((0,), dtype=torch.long)
+        return {
+            "rank": data.shape[-1] // 2,
+            "clustered_cols": data.shape[-1] // 2,
+            "mixed_tail_rank": data.shape[-1],
+            "rankdef_idx": torch.arange(data.shape[0], dtype=torch.long),
+            "clustered_idx": empty,
+            "scaled_nearrank_idx": empty,
+            "tiny_dense_idx": empty,
+            "fallback_idx": empty,
+        }
+
+    monkeypatch.setattr(candidate, "_mixed_structured_plan", rankdef_plan)
+
+    assert candidate._compute_route_plan(fake_data)[0] == "qr512_rankdef_fast"
 
     monkeypatch.setenv("FAST_QR_QR512_STRUCTURED_BEFORE_CUDA", "1")
     assert candidate._compute_route_plan(fake_data)[0] == "qr512_rankdef_fast"
@@ -3945,8 +3952,8 @@ def test_blocked_cuda_first_skips_classifier_when_structured_before_cuda_is_off(
     monkeypatch.setattr(candidate, "_qr1024_blocked_cuda_route_enabled", lambda _data: True)
     monkeypatch.setattr(candidate, "_qr512_cuda_route_enabled", lambda _data: True)
     monkeypatch.setattr(candidate, "_qr1024_cuda_route_enabled", lambda _data: True)
-    monkeypatch.setattr(candidate, "classify_512_sampled", fail_classifier)
-    monkeypatch.setattr(candidate, "classify_1024_sampled", fail_classifier)
+    monkeypatch.setattr(candidate, "classify_512_sampled", lambda _data: "dense")
+    monkeypatch.setattr(candidate, "classify_1024_sampled", lambda _data: "dense")
 
     assert candidate._compute_route_plan(fake512) == ("qr512_blocked_cuda_fast", None)
     assert candidate._compute_route_plan(fake1024) == ("qr1024_blocked_cuda_fast", None)
@@ -3957,8 +3964,25 @@ def test_structured_before_cuda_preempts_blocked_auto_for_homogeneous_structured
     fake512 = SimpleNamespace(shape=(640, 512, 512))
     fake1024 = SimpleNamespace(shape=(60, 1024, 1024))
 
-    def fail_mixed_plan(*_args, **_kwargs):
-        raise AssertionError("homogeneous structured routes should not build a mixed plan")
+    def structured_plan(data, cond=2):
+        batch = data.shape[0]
+        empty = torch.empty((0,), dtype=torch.long)
+        if data.shape[-1] == 512:
+            rankdef_idx = torch.arange(batch, dtype=torch.long)
+            scaled_nearrank_idx = empty
+        else:
+            rankdef_idx = empty
+            scaled_nearrank_idx = torch.arange(batch, dtype=torch.long)
+        return {
+            "rank": data.shape[-1] // 2,
+            "clustered_cols": data.shape[-1] // 2,
+            "mixed_tail_rank": data.shape[-1],
+            "rankdef_idx": rankdef_idx,
+            "clustered_idx": empty,
+            "scaled_nearrank_idx": scaled_nearrank_idx,
+            "tiny_dense_idx": empty,
+            "fallback_idx": empty,
+        }
 
     monkeypatch.setenv("FAST_QR_QR512_STRUCTURED_BEFORE_CUDA", "1")
     monkeypatch.setenv("FAST_QR_QR1024_STRUCTURED_BEFORE_CUDA", "1")
@@ -3972,15 +3996,16 @@ def test_structured_before_cuda_preempts_blocked_auto_for_homogeneous_structured
     monkeypatch.setattr(candidate, "_trust_sampled_structured_guards", lambda _data: True)
     monkeypatch.setattr(candidate, "classify_512_sampled", lambda _data: "rankdef")
     monkeypatch.setattr(candidate, "classify_1024_sampled", lambda _data: "nearrank")
-    monkeypatch.setattr(candidate, "_mixed_structured_plan", fail_mixed_plan)
+    monkeypatch.setattr(candidate, "_mixed_structured_plan", structured_plan)
+    monkeypatch.setattr(candidate, "_tail_matches_head_columns", lambda _data, _rank: True)
 
     assert candidate._compute_route_plan(fake512) == ("qr512_rankdef_fast", None)
     assert candidate._compute_route_plan(fake1024) == ("qr1024_nearrank_fast", None)
 
     monkeypatch.setenv("FAST_QR_QR512_STRUCTURED_BEFORE_CUDA", "0")
     monkeypatch.setenv("FAST_QR_QR1024_STRUCTURED_BEFORE_CUDA", "0")
-    monkeypatch.setattr(candidate, "classify_512_sampled", lambda _data: (_ for _ in ()).throw(AssertionError("classifier should be skipped")))
-    monkeypatch.setattr(candidate, "classify_1024_sampled", lambda _data: (_ for _ in ()).throw(AssertionError("classifier should be skipped")))
+    monkeypatch.setattr(candidate, "classify_512_sampled", lambda _data: "dense")
+    monkeypatch.setattr(candidate, "classify_1024_sampled", lambda _data: "dense")
 
     assert candidate._compute_route_plan(fake512) == ("qr512_blocked_cuda_auto_fast", None)
     assert candidate._compute_route_plan(fake1024) == ("qr1024_blocked_cuda_auto_fast", None)
@@ -4168,13 +4193,28 @@ def test_b200_default_uses_blocked_cuda_first_and_structured_first_is_opt_in(mon
     monkeypatch.setenv("FAST_QR_DENSE_TAIL_CUT_1024", "0")
     monkeypatch.setattr(candidate, "classify_512_sampled", lambda _data: "rankdef")
     monkeypatch.setattr(candidate, "classify_1024_sampled", lambda _data: "nearrank")
-    monkeypatch.setattr(candidate, "_batch_tail_columns_are_exact_zero", lambda _data, _rank: TrueLike())
     monkeypatch.setattr(candidate, "_tail_matches_head_columns", lambda _data, _rank: True)
+
+    def structured_plan(data, cond=2):
+        batch = data.shape[0]
+        empty = torch.empty((0,), dtype=torch.long)
+        return {
+            "rank": data.shape[-1] // 2,
+            "clustered_cols": data.shape[-1] // 2,
+            "mixed_tail_rank": data.shape[-1],
+            "rankdef_idx": torch.arange(batch, dtype=torch.long) if data.shape[-1] == 512 else empty,
+            "clustered_idx": empty,
+            "scaled_nearrank_idx": torch.arange(batch, dtype=torch.long) if data.shape[-1] == 1024 else empty,
+            "tiny_dense_idx": empty,
+            "fallback_idx": empty,
+        }
+
+    monkeypatch.setattr(candidate, "_mixed_structured_plan", structured_plan)
 
     assert not candidate._structured_before_cuda(512)
     assert not candidate._structured_before_cuda(1024)
-    assert candidate._compute_route_plan(fake512) == ("qr512_blocked_cuda_fast", None)
-    assert candidate._compute_route_plan(fake1024) == ("qr1024_blocked_cuda_fast", None)
+    assert candidate._compute_route_plan(fake512) == ("qr512_rankdef_fast", None)
+    assert candidate._compute_route_plan(fake1024) == ("qr1024_nearrank_fast", None)
 
     monkeypatch.setenv("FAST_QR_ENABLE_B200_DEFAULT_STRUCTURED_BEFORE_CUDA", "1")
     assert candidate._structured_before_cuda(512)
@@ -4184,7 +4224,7 @@ def test_b200_default_uses_blocked_cuda_first_and_structured_first_is_opt_in(mon
 
     monkeypatch.setenv("FAST_QR_QR512_STRUCTURED_BEFORE_CUDA", "0")
     assert not candidate._structured_before_cuda(512)
-    assert candidate._compute_route_plan(fake512) == ("qr512_blocked_cuda_fast", None)
+    assert candidate._compute_route_plan(fake512) == ("qr512_rankdef_fast", None)
 
     monkeypatch.delenv("FAST_QR_QR512_STRUCTURED_BEFORE_CUDA")
     monkeypatch.setenv("FAST_QR_DISABLE_B200_DEFAULT_STRUCTURED_BEFORE_CUDA", "1")
@@ -4192,7 +4232,7 @@ def test_b200_default_uses_blocked_cuda_first_and_structured_first_is_opt_in(mon
     assert not candidate._structured_before_cuda(1024)
 
 
-def test_b200_default_structured_first_samples_before_auto_policy(monkeypatch):
+def test_b200_default_samples_structured_cases_before_auto_policy(monkeypatch):
     candidate = _load_candidate_module()
     candidate._B200_DEVICE_CACHE.clear()
     props = SimpleNamespace(name="NVIDIA B200", major=10, total_memory=180 * 1024**3)
@@ -4217,22 +4257,20 @@ def test_b200_default_structured_first_samples_before_auto_policy(monkeypatch):
 
     assert candidate._compute_route_plan(fake512) == ("qr512_blocked_cuda_auto_fast", None)
     assert candidate._compute_route_plan(fake1024) == ("qr1024_blocked_cuda_auto_fast", None)
-    assert calls == []
+    assert calls == ["512", "1024"]
 
     monkeypatch.setenv("FAST_QR_ENABLE_B200_DEFAULT_STRUCTURED_BEFORE_CUDA", "1")
     assert candidate._compute_route_plan(fake512) == ("qr512_blocked_cuda_auto_fast", None)
     assert candidate._compute_route_plan(fake1024) == ("qr1024_blocked_cuda_auto_fast", None)
-    assert calls == ["512", "1024"]
-
-    def fail_classifier(_data):
-        raise AssertionError("auto blocked policy should bypass Python sampled classifier when structured-first is off")
+    assert calls == ["512", "1024", "512", "1024"]
 
     monkeypatch.delenv("FAST_QR_ENABLE_B200_DEFAULT_STRUCTURED_BEFORE_CUDA")
-    monkeypatch.setattr(candidate, "classify_512_sampled", fail_classifier)
-    monkeypatch.setattr(candidate, "classify_1024_sampled", fail_classifier)
+    monkeypatch.setattr(candidate, "classify_512_sampled", lambda _data: calls.append("512b") or "dense")
+    monkeypatch.setattr(candidate, "classify_1024_sampled", lambda _data: calls.append("1024b") or "dense")
 
     assert candidate._compute_route_plan(fake512) == ("qr512_blocked_cuda_auto_fast", None)
     assert candidate._compute_route_plan(fake1024) == ("qr1024_blocked_cuda_auto_fast", None)
+    assert calls[-2:] == ["512b", "1024b"]
 
 
 def test_structured_first_dense_classification_uses_threshold_checked_tail_route(monkeypatch):
@@ -4276,7 +4314,7 @@ def test_structured_first_dense_classification_uses_threshold_checked_tail_route
         (1024, "qr1024_fast", "_qr1024_blocked_cuda_route_enabled", "_qr1024_blocked_cuda_auto_fast", "classify_1024_sampled"),
     ],
 )
-def test_candidate_shape_fast_uses_blocked_auto_before_classifier(
+def test_candidate_shape_fast_checks_classifier_before_blocked_auto(
     monkeypatch,
     n,
     fast_name,
@@ -4288,28 +4326,24 @@ def test_candidate_shape_fast_uses_blocked_auto_before_classifier(
     data = SimpleNamespace(shape=(640 if n == 512 else 60, n, n))
     sentinel = object()
 
-    def fail_classifier(_data):
-        raise AssertionError("shape fast path should use blocked auto before Python classifier")
+    calls = []
 
     monkeypatch.setattr(candidate, route_name, lambda _data: True)
+    monkeypatch.setattr(candidate, "_qr512_cuda_route_enabled", lambda _data: False)
+    monkeypatch.setattr(candidate, "_qr1024_cuda_route_enabled", lambda _data: False)
     monkeypatch.setattr(candidate, "_blocked_auto_policy_enabled", lambda _data, shape_n: shape_n == n)
     monkeypatch.setattr(candidate, auto_name, lambda _data: sentinel)
-    monkeypatch.setattr(candidate, classifier_name, fail_classifier)
+    monkeypatch.setattr(candidate, classifier_name, lambda _data: calls.append("classify") or "dense")
+    monkeypatch.setattr(candidate, "_classified_dense_tail_route_or_fallback", lambda _data, _route: "torch.geqrf")
 
     assert getattr(candidate, fast_name)(data) is sentinel
+    assert calls == ["classify"]
 
 
 def test_blocked_structured_first_still_uses_classifier(monkeypatch):
     candidate = _load_candidate_module()
     fake512 = SimpleNamespace(shape=(640, 512, 512))
     fake1024 = SimpleNamespace(shape=(60, 1024, 1024))
-
-    class TrueLike:
-        def all(self):
-            return self
-
-        def item(self):
-            return True
 
     monkeypatch.setenv("FAST_QR_QR512_STRUCTURED_BEFORE_CUDA", "1")
     monkeypatch.setenv("FAST_QR_QR1024_STRUCTURED_BEFORE_CUDA", "1")
@@ -4319,8 +4353,22 @@ def test_blocked_structured_first_still_uses_classifier(monkeypatch):
     monkeypatch.setattr(candidate, "_qr1024_cuda_route_enabled", lambda _data: True)
     monkeypatch.setattr(candidate, "classify_512_sampled", lambda _data: "rankdef")
     monkeypatch.setattr(candidate, "classify_1024_sampled", lambda _data: "nearrank")
-    monkeypatch.setattr(candidate, "_batch_tail_columns_are_exact_zero", lambda _data, _rank: TrueLike())
     monkeypatch.setattr(candidate, "_tail_matches_head_columns", lambda _data, _rank: True)
+
+    def rankdef_plan(data, cond=2):
+        empty = torch.empty((0,), dtype=torch.long)
+        return {
+            "rank": data.shape[-1] // 2,
+            "clustered_cols": data.shape[-1] // 2,
+            "mixed_tail_rank": data.shape[-1],
+            "rankdef_idx": torch.arange(data.shape[0], dtype=torch.long),
+            "clustered_idx": empty,
+            "scaled_nearrank_idx": empty,
+            "tiny_dense_idx": empty,
+            "fallback_idx": empty,
+        }
+
+    monkeypatch.setattr(candidate, "_mixed_structured_plan", rankdef_plan)
 
     assert candidate._compute_route_plan(fake512) == ("qr512_rankdef_fast", None)
     assert candidate._compute_route_plan(fake1024) == ("qr1024_nearrank_fast", None)
@@ -4567,7 +4615,7 @@ def test_custom_kernel_small_public_cuda_shapes_keep_wrapper_for_non_float32(
         ),
     ],
 )
-def test_custom_kernel_public_ambiguous_shapes_bypass_route_planning_on_b200_cuda_first(
+def test_custom_kernel_public_ambiguous_shapes_use_route_planning_on_b200(
     monkeypatch,
     batch,
     n,
@@ -4580,16 +4628,25 @@ def test_custom_kernel_public_ambiguous_shapes_bypass_route_planning_on_b200_cud
 
     monkeypatch.setattr(candidate, "_structured_before_cuda", lambda shape_n: False)
     monkeypatch.setattr(candidate, "_blocked_cuda_auto_route_enabled", lambda _data, shape_n: shape_n == n)
-    monkeypatch.setattr(candidate, private_name, lambda _data: sentinel)
+    monkeypatch.setattr(
+        candidate,
+        private_name,
+        lambda _data: (_ for _ in ()).throw(AssertionError("B200 public 512/1024 path must route-plan")),
+    )
     monkeypatch.setattr(
         candidate,
         auto_name,
-        lambda _data: (_ for _ in ()).throw(AssertionError("B200 public hot path should bypass wrapper")),
+        lambda _data: (_ for _ in ()).throw(AssertionError("route planning test should dispatch through stub")),
     )
     monkeypatch.setattr(
         candidate,
         "_route_plan_for_data",
-        lambda _data: (_ for _ in ()).throw(AssertionError("B200 public hot path should not route-plan")),
+        lambda _data: (auto_name, {"planned": True}),
+    )
+    monkeypatch.setattr(
+        candidate,
+        "_dispatch_route",
+        lambda route, _data, plan=None: sentinel if route == auto_name and plan == {"planned": True} else None,
     )
 
     assert candidate.custom_kernel(data) is sentinel
@@ -8644,7 +8701,7 @@ def test_candidate_mixed_structured_fast_uses_blocked_group_paths_when_enabled(
     full_name,
 ):
     candidate = _load_candidate_module()
-    data = torch.empty((5, n, n), dtype=torch.float32)
+    data = torch.empty((4, n, n), dtype=torch.float32)
     rank = candidate._rankdef_effective_cols(n)
     clustered_cols = candidate._clustered_effective_cols(n)
     tiny_rank = max(1, n - 8)
@@ -8656,7 +8713,7 @@ def test_candidate_mixed_structured_fast_uses_blocked_group_paths_when_enabled(
         "clustered_idx": torch.tensor([1], dtype=torch.long),
         "scaled_nearrank_idx": torch.tensor([2], dtype=torch.long),
         "tiny_dense_idx": torch.tensor([3], dtype=torch.long),
-        "fallback_idx": torch.tensor([4], dtype=torch.long),
+        "fallback_idx": torch.empty((0,), dtype=torch.long),
     }
     calls = []
 
@@ -8676,26 +8733,24 @@ def test_candidate_mixed_structured_fast_uses_blocked_group_paths_when_enabled(
     monkeypatch.setattr(candidate, blocked_route_name, lambda _data: True)
     monkeypatch.setattr(candidate, factor_name, output_for(1.0, "factor"))
     monkeypatch.setattr(candidate, tail_name, output_for(2.0, "tail"))
-    monkeypatch.setattr(candidate, full_name, output_for(3.0, "full"))
     monkeypatch.setattr(candidate, "_scatter_rectangular_geqrf_indices", fail_rectangular_scatter)
 
     h, tau = candidate._mixed_structured_fast_from_plan(data, plan)
 
-    assert h[:, 0, 0].tolist() == [1.0, 1.0, 2.0, 2.0, 3.0]
-    assert tau[:, 0].tolist() == [1.0, 1.0, 2.0, 2.0, 3.0]
+    assert h[:, 0, 0].tolist() == [1.0, 1.0, 2.0, 2.0]
+    assert tau[:, 0].tolist() == [1.0, 1.0, 2.0, 2.0]
     assert calls == [
         ("factor", 1, rank),
         ("factor", 1, clustered_cols),
         ("tail", 1, rank),
         ("tail", 1, tiny_rank),
-        ("full", 1, None),
     ]
 
 
 def test_candidate_mixed_structured_fast_uses_indexed_blocked_writes(monkeypatch):
     candidate = _load_candidate_module()
     n = 512
-    data = torch.empty((5, n, n), dtype=torch.float32)
+    data = torch.empty((4, n, n), dtype=torch.float32)
     rank = candidate._rankdef_effective_cols(n)
     clustered_cols = candidate._clustered_effective_cols(n)
     tiny_rank = n - 8
@@ -8707,7 +8762,7 @@ def test_candidate_mixed_structured_fast_uses_indexed_blocked_writes(monkeypatch
         "clustered_idx": torch.tensor([1], dtype=torch.long),
         "scaled_nearrank_idx": torch.tensor([2], dtype=torch.long),
         "tiny_dense_idx": torch.tensor([3], dtype=torch.long),
-        "fallback_idx": torch.tensor([4], dtype=torch.long),
+        "fallback_idx": torch.empty((0,), dtype=torch.long),
     }
     calls = []
 
@@ -8739,14 +8794,13 @@ def test_candidate_mixed_structured_fast_uses_indexed_blocked_writes(monkeypatch
 
     h, tau = candidate._mixed_structured_fast_from_plan(data, plan)
 
-    assert h[:, 0, 0].tolist() == [1.0, 2.0, 3.0, 4.0, 5.0]
-    assert tau[:, 0].tolist() == [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert h[:, 0, 0].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert tau[:, 0].tolist() == [1.0, 2.0, 3.0, 4.0]
     assert calls == [
         ("factor", [0], rank),
         ("factor", [1], clustered_cols),
         ("tail", [2], rank),
         ("tail", [3], tiny_rank),
-        ("full", [4], None),
     ]
 
 
@@ -8831,28 +8885,35 @@ def test_candidate_mixed_plan_can_trust_sampled_guards_without_exact_checks(monk
     assert int(plan["fallback_idx"].numel()) > 0
 
 
-def test_candidate_trusted_sampled_guards_skip_homogeneous_exact_route_checks(monkeypatch):
+def test_candidate_trusted_sampled_guards_skip_rankdef_exact_route_checks(monkeypatch):
     candidate = _load_candidate_module()
     fake512 = SimpleNamespace(is_cuda=False, shape=(640, 512, 512))
-    fake1024 = SimpleNamespace(is_cuda=False, shape=(60, 1024, 1024))
 
     def fail_exact(*_args, **_kwargs):
         raise AssertionError("trusted sampled guard route should not run full exact checks")
 
+    def rankdef_plan(data, cond=2):
+        empty = torch.empty((0,), dtype=torch.long)
+        return {
+            "rank": data.shape[-1] // 2,
+            "clustered_cols": data.shape[-1] // 2,
+            "mixed_tail_rank": data.shape[-1],
+            "rankdef_idx": torch.arange(data.shape[0], dtype=torch.long),
+            "clustered_idx": empty,
+            "scaled_nearrank_idx": empty,
+            "tiny_dense_idx": empty,
+            "fallback_idx": empty,
+        }
+
     monkeypatch.setenv("FAST_QR_TRUST_SAMPLED_STRUCTURED_GUARDS", "1")
     monkeypatch.setenv("FAST_QR_QR512_STRUCTURED_BEFORE_CUDA", "1")
-    monkeypatch.setenv("FAST_QR_QR1024_STRUCTURED_BEFORE_CUDA", "1")
     monkeypatch.setenv("FAST_QR_DENSE_TAIL_CUT_512", "0")
-    monkeypatch.setenv("FAST_QR_DENSE_TAIL_CUT_1024", "0")
     monkeypatch.setattr(candidate, "classify_512_sampled", lambda _data: "rankdef")
-    monkeypatch.setattr(candidate, "classify_1024_sampled", lambda _data: "nearrank")
+    monkeypatch.setattr(candidate, "_mixed_structured_plan", rankdef_plan)
     monkeypatch.setattr(candidate, "_batch_tail_columns_are_exact_zero", fail_exact)
     monkeypatch.setattr(candidate, "_batch_tail_columns_are_tiny_relative", fail_exact)
-    monkeypatch.setattr(candidate, "_tail_matches_head_columns", fail_exact)
-    monkeypatch.setattr(candidate, "_batch_tail_matches_scaled_head_columns", fail_exact)
 
     assert candidate._compute_route_plan(fake512) == ("qr512_rankdef_fast", None)
-    assert candidate._compute_route_plan(fake1024) == ("qr1024_nearrank_fast", None)
 
 
 @pytest.mark.parametrize(
@@ -9385,6 +9446,100 @@ def test_mixed_seed_sweep_on_small_case():
 def test_mixed_seed_sweep_accepts_blocked_auto_routes():
     assert "qr512_blocked_cuda_auto_fast" in allowed_mixed_routes({"n": 512})
     assert "qr1024_blocked_cuda_auto_fast" in allowed_mixed_routes({"n": 1024})
+
+
+def test_mixed_structured_fallback_uses_geqrf_not_blocked_full_qr(monkeypatch):
+    candidate = _load_candidate_module()
+    data = torch.randn((3, 4, 4), dtype=torch.float32)
+    empty = torch.empty((0,), dtype=torch.long)
+    plan = {
+        "rank": 2,
+        "clustered_cols": 2,
+        "mixed_tail_rank": 4,
+        "rankdef_idx": empty,
+        "clustered_idx": empty,
+        "scaled_nearrank_idx": empty,
+        "tiny_dense_idx": empty,
+        "fallback_idx": torch.arange(3, dtype=torch.long),
+    }
+
+    def fail_blocked_full(*_args, **_kwargs):
+        raise AssertionError("mixed fallback rows must not use blocked full QR")
+
+    monkeypatch.setattr(candidate, "_blocked_cuda_full_into", fail_blocked_full)
+
+    h, tau = candidate._mixed_structured_fast_from_plan(data, plan)
+
+    assert h.shape == data.shape
+    assert tau.shape == (3, 4)
+    assert torch.isfinite(h).all()
+    assert torch.isfinite(tau).all()
+
+
+@pytest.mark.parametrize(
+    ("batch", "n", "route"),
+    [
+        (640, 512, "qr512_mixed_fast"),
+        (60, 1024, "qr1024_mixed_fast"),
+    ],
+)
+def test_public_512_1024_entrypoint_uses_route_plan_before_auto(monkeypatch, batch, n, route):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(batch, n, n))
+    sentinel = object()
+
+    def fail_public_auto(_data):
+        raise AssertionError("public 512/1024 entrypoint must not bypass route planning")
+
+    monkeypatch.setattr(candidate, "_qr512_blocked_cuda_auto_public_fast", fail_public_auto)
+    monkeypatch.setattr(candidate, "_qr1024_blocked_cuda_auto_public_fast", fail_public_auto)
+    monkeypatch.setattr(candidate, "_route_plan_for_data", lambda _data: (route, {"planned": True}))
+    monkeypatch.setattr(
+        candidate,
+        "_dispatch_route",
+        lambda planned_route, _data, plan=None: sentinel
+        if planned_route == route and plan == {"planned": True}
+        else None,
+    )
+
+    assert candidate.custom_kernel(data) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("n", "classifier_name", "route_name", "expected_route"),
+    [
+        (512, "classify_512_sampled", "_qr512_blocked_cuda_route_enabled", "qr512_mixed_fast"),
+        (1024, "classify_1024_sampled", "_qr1024_blocked_cuda_route_enabled", "qr1024_mixed_fast"),
+    ],
+)
+def test_mixed_route_plan_preempts_blocked_auto(monkeypatch, n, classifier_name, route_name, expected_route):
+    candidate = _load_candidate_module()
+    batch = 640 if n == 512 else 60
+    data = SimpleNamespace(shape=(batch, n, n))
+    empty = torch.empty((0,), dtype=torch.long)
+    fallback = torch.arange(batch - 1, dtype=torch.long)
+    plan = {
+        "rank": n // 2,
+        "clustered_cols": n // 2,
+        "mixed_tail_rank": n,
+        "rankdef_idx": torch.tensor([batch - 1], dtype=torch.long),
+        "clustered_idx": empty,
+        "scaled_nearrank_idx": empty,
+        "tiny_dense_idx": empty,
+        "fallback_idx": fallback,
+    }
+
+    monkeypatch.setattr(candidate, route_name, lambda _data: True)
+    monkeypatch.setattr(candidate, "_qr512_cuda_route_enabled", lambda _data: False)
+    monkeypatch.setattr(candidate, "_qr1024_cuda_route_enabled", lambda _data: False)
+    monkeypatch.setattr(candidate, "_blocked_auto_policy_enabled", lambda _data, shape_n: shape_n == n)
+    monkeypatch.setattr(candidate, classifier_name, lambda _data: "mixed")
+    monkeypatch.setattr(candidate, "_mixed_structured_plan", lambda _data, cond=2: plan)
+
+    route, actual_plan = candidate._compute_route_plan(data)
+
+    assert route == expected_route
+    assert actual_plan is plan
 
 
 def test_tail_policy_sweep_candidate_cut_on_small_case():
