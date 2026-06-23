@@ -180,6 +180,16 @@ def apply_suite_env_options(env: dict[str, str], args: argparse.Namespace) -> di
     return out
 
 
+def with_python_bin_on_path(env: dict[str, str], python: str) -> dict[str, str]:
+    out = env.copy()
+    python_bin = str(Path(python).parent)
+    path = out.get("PATH", "")
+    parts = [part for part in path.split(os.pathsep) if part]
+    if python_bin not in parts:
+        out["PATH"] = os.pathsep.join([python_bin, *parts])
+    return out
+
+
 def visible_suite_env(env: dict[str, str], args: argparse.Namespace) -> dict[str, str | None]:
     keys = suite_env_overrides(args)
     return {key: env.get(key) for key in keys if env.get(key) is not None}
@@ -1174,8 +1184,8 @@ def main() -> int:
     log_path = suite_dir / "run.log"
     manifest_path = suite_dir / "manifest.jsonl"
 
-    env = apply_suite_env_options(os.environ.copy(), args)
     python = sys.executable
+    env = with_python_bin_on_path(apply_suite_env_options(os.environ.copy(), args), python)
     popcorn_seed_args = []
     if args.popcorn_seed is not None:
         popcorn_seed_args = ["--popcorn-seed", str(args.popcorn_seed)]

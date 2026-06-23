@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import os
@@ -20,7 +21,7 @@ from qr_common import (
 )
 from summarize_suite import load_jsonl
 from tune_tail_policy import (
-    config_prefix,
+    config_prefix as tail_config_prefix,
     load_config_rows,
     merged_env,
     parse_inline_config,
@@ -31,6 +32,16 @@ from tune_tail_policy import (
 
 
 DEFAULT_CONFIGS: list[dict[str, Any]] = [{"name": "default", "env": {}}]
+
+
+def config_prefix(index: int, name: str) -> str:
+    base = tail_config_prefix(index, name)
+    if len(base) <= 96:
+        return base
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:12]
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-")
+    slug = slug[:48].rstrip("._-") or "config"
+    return f"{index + 1:03d}_{slug}_{digest}"
 
 PTXAS_USED_RE = re.compile(r"ptxas info\s*:\s*Used\s+(\d+)\s+registers(?P<rest>.*)")
 PTXAS_FUNCTION_RE = re.compile(r"ptxas info\s*:\s*Function properties for\s+(.+)")

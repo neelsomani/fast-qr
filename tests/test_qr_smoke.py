@@ -21,6 +21,14 @@ SYNTHETIC_CANDIDATE_SHA = "82e50331c6aac55c842855a1eea6218e1e27e748ad17e296ec651
 SYNTHETIC_BASELINE_SHA = "b" * 64
 SYNTHETIC_BAD_SHA = "c" * 64
 
+
+@pytest.fixture(autouse=True)
+def stable_unit_test_runtime(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("FAST_QR_DISABLE_B200_DEFAULT_BLOCKED_CUDA", "1")
+    monkeypatch.setenv("FAST_QR_DISABLE_B200_TRUST_SAMPLED_STRUCTURED_GUARDS", "1")
+
+
 from qr_common import (  # noqa: E402
     CANDIDATE_RUNTIME_ENV_KEYS,
     ensure_official_on_path,
@@ -88,6 +96,7 @@ from run_b200_suite import (  # noqa: E402
     dry_run_plan,
     suite_env_overrides,
     suite_provenance,
+    with_python_bin_on_path,
     write_candidate_config_tune_large_kernel_plan,
 )
 from seed_sweep import parse_int_list, run_case  # noqa: E402
@@ -110,6 +119,7 @@ from tune_tail_policy import (  # noqa: E402
 from tune_candidate_configs import (  # noqa: E402
     CURRENT_CANDIDATE_CONSUMED_ENV_KEYS,
     command_plan as candidate_config_command_plan,
+    config_prefix as candidate_config_prefix,
     env_consumption as candidate_config_env_consumption,
     grid_configs as candidate_grid_configs,
     load_configs as load_candidate_tune_configs,
@@ -472,6 +482,8 @@ def test_check_cases_helpers_on_small_case():
 
 
 def test_environment_info_contains_compact_result_provenance(monkeypatch):
+    monkeypatch.delenv("FAST_QR_DISABLE_B200_DEFAULT_BLOCKED_CUDA")
+    monkeypatch.delenv("FAST_QR_DISABLE_B200_TRUST_SAMPLED_STRUCTURED_GUARDS")
     monkeypatch.setenv("FAST_QR_QR512_PANEL_B", "32")
     monkeypatch.setenv("FAST_QR_QR512_PRECISION_MODE", "tf32-input")
     monkeypatch.setenv("FAST_QR_QR512_BLOCKED_POLICY_SAMPLE_ROWS", "12")
@@ -607,6 +619,32 @@ def test_b200_suite_qr32_sm100_shortcut_sets_extra_compile_flags():
     args = SimpleNamespace(torch_cuda_arch_list="10.0", qr32_extra_cuda_cflags=None, qr32_sm100=True)
     assert suite_env_overrides(args)["FAST_QR_QR32_EXTRA_CUDA_CFLAGS"] == "-arch=sm_100"
     assert apply_suite_env_options({}, args)["FAST_QR_QR32_EXTRA_CUDA_CFLAGS"] == "-arch=sm_100"
+
+
+def test_b200_suite_prepends_python_bin_to_path():
+    env = with_python_bin_on_path({"PATH": "/usr/bin:/bin"}, "/workspace/fast-qr/.venv/bin/python")
+    assert env["PATH"].split(os.pathsep)[:3] == ["/workspace/fast-qr/.venv/bin", "/usr/bin", "/bin"]
+
+    unchanged = with_python_bin_on_path(
+        {"PATH": "/workspace/fast-qr/.venv/bin:/usr/bin"},
+        "/workspace/fast-qr/.venv/bin/python",
+    )
+    assert unchanged["PATH"] == "/workspace/fast-qr/.venv/bin:/usr/bin"
+
+
+def test_candidate_config_prefix_shortens_long_names():
+    name = (
+        "qr512__seed_b200_default_reflector_frontload_2cta__panel_b_32"
+        "__precision_mode_fp32__panel_refresh_mode_prefix__r_maintenance_mode_panel-prefix"
+        "__compact_wy_tile_cols_4__warps_per_cta_8__ctas_per_matrix_2"
+        "__cta_schedule_frontload__sync_free_auto_policy_0__blocked_auto_groups_1"
+        "__tail_cut_16__tail_threshold_0_03__tail_force_0__structured_before_cuda_0"
+    )
+    prefix = candidate_config_prefix(0, name)
+
+    assert prefix.startswith("001_qr512__seed_b200_default_reflector_frontload")
+    assert len(f"{prefix}_correctness.jsonl") < 128
+    assert candidate_config_prefix(0, "default") == "000_default"
 
 
 def test_b200_suite_dry_run_exposes_compile_environment(tmp_path):
@@ -4028,14 +4066,26 @@ def test_b200_default_promotes_blocked_cuda_routes(monkeypatch):
         4096: SimpleNamespace(is_cuda=True, dtype=torch.float32, ndim=3, shape=(2, 4096, 4096), device=torch.device("cuda", 0)),
     }
 
-    assert candidate._qr512_blocked_cuda_route_enabled(fakes[512])
-    assert candidate._qr1024_blocked_cuda_route_enabled(fakes[1024])
+    assert not candidate._qr512_blocked_cuda_route_enabled(fakes[512])
+    assert not candidate._qr1024_blocked_cuda_route_enabled(fakes[1024])
     assert candidate._qr2048_blocked_cuda_route_enabled(fakes[2048])
     assert candidate._qr4096_blocked_cuda_route_enabled(fakes[4096])
+    assert not candidate._qr512_cuda_route_enabled(fakes[512])
+    assert not candidate._qr1024_cuda_route_enabled(fakes[1024])
     assert candidate._blocked_cuda_auto_route_enabled(fakes[512], 512)
     assert candidate._blocked_cuda_auto_route_enabled(fakes[1024], 1024)
     assert candidate._blocked_cuda_auto_route_enabled(fakes[2048], 2048)
     assert candidate._blocked_cuda_auto_route_enabled(fakes[4096], 4096)
+    monkeypatch.setenv("FAST_QR_ENABLE_QR512_BLOCKED_CUDA", "1")
+    monkeypatch.setenv("FAST_QR_ENABLE_QR1024_BLOCKED_CUDA", "1")
+    monkeypatch.setenv("FAST_QR_ENABLE_QR512_CUDA", "1")
+    monkeypatch.setenv("FAST_QR_ENABLE_QR1024_CUDA", "1")
+    assert candidate._qr512_blocked_cuda_route_enabled(fakes[512])
+    assert candidate._qr1024_blocked_cuda_route_enabled(fakes[1024])
+    assert candidate._qr512_cuda_route_enabled(fakes[512])
+    assert candidate._qr1024_cuda_route_enabled(fakes[1024])
+    assert candidate._blocked_cuda_auto_route_enabled(fakes[512], 512)
+    assert candidate._blocked_cuda_auto_route_enabled(fakes[1024], 1024)
     assert candidate._qr32_cuda_warps_per_cta() == 8
     assert candidate._qr32_cuda_threads_per_cta() == 256
     assert candidate._qr176_cuda_update_col_tile() == 16
@@ -4044,12 +4094,12 @@ def test_b200_default_promotes_blocked_cuda_routes(monkeypatch):
     assert candidate._generic_blocked_cuda_loader_state(2048, fakes[2048])[1] is True
     assert candidate._qr512_blocked_cuda_panel_refresh_mode() == "prefix"
     assert candidate._qr512_blocked_cuda_r_maintenance_mode() == "panel-prefix"
-    assert candidate._qr512_blocked_cuda_update_mode() == "compact-wy"
+    assert candidate._qr512_blocked_cuda_update_mode() == "reflectors"
     assert candidate._qr352_cuda_update_mode() == "compact-wy"
     assert candidate._qr512_blocked_cuda_tile_n() == 128
     assert candidate._qr512_blocked_cuda_ctas_per_matrix() == 2
     assert candidate._qr512_blocked_cuda_cta_schedule() == "frontload"
-    assert candidate._qr512_blocked_cuda_sync_free_auto_policy()
+    assert not candidate._qr512_blocked_cuda_sync_free_auto_policy()
     assert candidate._qr1024_blocked_cuda_panel_refresh_mode() == "prefix"
     assert candidate._qr1024_blocked_cuda_update_mode() == "compact-wy"
     assert candidate._qr1024_blocked_cuda_ctas_per_matrix() == 2
@@ -4074,9 +4124,9 @@ def test_b200_default_promotes_blocked_cuda_routes(monkeypatch):
     assert "constexpr int UPDATE_COL_TILE = 16;" in candidate._qr176_cuda_source()
     assert "constexpr int UPDATE_COL_TILE = 16;" in candidate._qr352_cuda_source()
     assert "constexpr int PANEL_B = 64;" in candidate._qr352_cuda_source()
-    assert "constexpr int SYNC_FREE_AUTO_POLICY = 1;" in candidate._qr512_blocked_cuda_source()
+    assert "constexpr int SYNC_FREE_AUTO_POLICY = 0;" in candidate._qr512_blocked_cuda_source()
     assert "constexpr int USE_COMPACT_WY_UPDATE = 1;" in candidate._qr352_cuda_source()
-    assert "constexpr int USE_COMPACT_WY_UPDATE = 1;" in candidate._qr512_blocked_cuda_source()
+    assert "constexpr int USE_COMPACT_WY_UPDATE = 0;" in candidate._qr512_blocked_cuda_source()
     assert "constexpr int TILE_N = 128;" in candidate._qr512_blocked_cuda_source()
     assert "constexpr int CTAS_PER_MATRIX = 2;" in candidate._qr512_blocked_cuda_source()
     assert "constexpr int CTA_SCHEDULE_FRONTLOAD = 1;" in candidate._qr512_blocked_cuda_source()
@@ -4111,6 +4161,10 @@ def test_b200_default_promotes_blocked_cuda_routes(monkeypatch):
     assert candidate._compute_route_plan(fakes[2048]) == ("qr2048_blocked_cuda_auto_fast", None)
     assert candidate._compute_route_plan(fakes[4096]) == ("qr4096_blocked_cuda_auto_fast", None)
 
+    monkeypatch.delenv("FAST_QR_ENABLE_QR512_BLOCKED_CUDA")
+    monkeypatch.delenv("FAST_QR_ENABLE_QR1024_BLOCKED_CUDA")
+    monkeypatch.delenv("FAST_QR_ENABLE_QR512_CUDA")
+    monkeypatch.delenv("FAST_QR_ENABLE_QR1024_CUDA")
     monkeypatch.setenv("FAST_QR_DISABLE_B200_DEFAULT_BLOCKED_CUDA", "1")
     candidate._B200_DEVICE_CACHE.clear()
     assert not candidate._qr512_blocked_cuda_route_enabled(fakes[512])
@@ -4188,6 +4242,7 @@ def test_b200_default_uses_blocked_cuda_first_and_structured_first_is_opt_in(mon
     monkeypatch.delenv("FAST_QR_STRUCTURED_ROUTES_BEFORE_CUDA", raising=False)
     monkeypatch.delenv("FAST_QR_DISABLE_B200_DEFAULT_STRUCTURED_BEFORE_CUDA", raising=False)
     monkeypatch.delenv("FAST_QR_ENABLE_B200_DEFAULT_STRUCTURED_BEFORE_CUDA", raising=False)
+    monkeypatch.delenv("FAST_QR_DISABLE_B200_DEFAULT_BLOCKED_CUDA")
     monkeypatch.setenv("FAST_QR_DISABLE_BLOCKED_AUTO_POLICY", "1")
     monkeypatch.setenv("FAST_QR_DENSE_TAIL_CUT_512", "0")
     monkeypatch.setenv("FAST_QR_DENSE_TAIL_CUT_1024", "0")
@@ -4250,6 +4305,8 @@ def test_b200_default_samples_structured_cases_before_auto_policy(monkeypatch):
     monkeypatch.setattr(candidate.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(candidate.torch.cuda, "get_device_properties", lambda _index: props)
     monkeypatch.delenv("FAST_QR_ENABLE_B200_DEFAULT_STRUCTURED_BEFORE_CUDA", raising=False)
+    monkeypatch.setenv("FAST_QR_ENABLE_QR512_BLOCKED_CUDA", "1")
+    monkeypatch.setenv("FAST_QR_ENABLE_QR1024_BLOCKED_CUDA", "1")
     monkeypatch.setenv("FAST_QR_DENSE_TAIL_CUT_512", "0")
     monkeypatch.setenv("FAST_QR_DENSE_TAIL_CUT_1024", "0")
     monkeypatch.setattr(candidate, "classify_512_sampled", lambda _data: calls.append("512") or "dense")
@@ -5162,8 +5219,8 @@ def test_candidate_route_cache_invalidates_on_tail_policy_env_change(monkeypatch
         return f"cut_{candidate._dense_tail_cut(512)}", None
 
     monkeypatch.setattr(candidate, "_compute_route_plan", tail_route)
-    assert candidate._route_for_data(data) == "cut_32"
-    assert candidate._route_for_data(data) == "cut_32"
+    assert candidate._route_for_data(data) == "cut_16"
+    assert candidate._route_for_data(data) == "cut_16"
 
     monkeypatch.setenv("FAST_QR_DENSE_TAIL_CUT_512", "12")
     assert candidate._route_for_data(data) == "cut_12"
@@ -5757,6 +5814,8 @@ def test_candidate_blocked_cuda_update_col_end_is_on_trailing_kernel_signature()
 
 def test_candidate_blocked_cuda_consumes_shape_family_env_aliases(monkeypatch):
     candidate = _load_candidate_module()
+    candidate._B200_DEVICE_CACHE.clear()
+    monkeypatch.setenv("FAST_QR_DISABLE_B200_DEFAULT_BLOCKED_CUDA", "1")
 
     monkeypatch.setenv("FAST_QR_QR512_PANEL_B", "48")
     monkeypatch.setenv("FAST_QR_QR512_TILE_N", "16")
@@ -6046,7 +6105,7 @@ def test_candidate_blocked_cuda_source_and_build_key_cache_tracks_config(monkeyp
 def test_candidate_blocked_auto_policy_source_uses_dense_tail_env(monkeypatch):
     candidate = _load_candidate_module()
 
-    assert "constexpr int DENSE_TAIL_CUT = 32;" in candidate._qr512_blocked_cuda_source()
+    assert "constexpr int DENSE_TAIL_CUT = 16;" in candidate._qr512_blocked_cuda_source()
     assert "constexpr int MIXED_DENSE_TAIL_CUT = 0;" in candidate._qr512_blocked_cuda_source()
     assert "constexpr float DENSE_TAIL_THRESHOLD = 3.000000000e-02f;" in candidate._qr512_blocked_cuda_source()
     assert "constexpr float MIXED_DENSE_TAIL_THRESHOLD = 0.000000000e+00f;" in candidate._qr512_blocked_cuda_source()
@@ -7060,7 +7119,7 @@ def test_candidate_blocked_auto_policy_keeps_n_tail_group_when_mixed_tail_cut_di
     dense_tail = n - candidate._dense_tail_cut(n)
 
     assert candidate._mixed_dense_tail_cut(n) == 0
-    assert dense_tail == 480
+    assert dense_tail == 496
     factor_cols = torch.tensor([rank, dense_tail, n], dtype=torch.int32)
     project_tail = torch.tensor([1, 1, 1], dtype=torch.int32)
 
@@ -8321,7 +8380,7 @@ def test_candidate_nearrank_tail_projection_passes_case():
 
 @pytest.mark.parametrize(
     ("n", "cond", "cut", "max_factor_scaled"),
-    [(512, 2, 32, 18.0), (1024, 2, 64, 20.0)],
+    [(512, 2, 16, 18.0), (1024, 2, 64, 20.0)],
 )
 def test_candidate_dense_tail_projection_passes_scaled_dense_cases(n, cond, cut, max_factor_scaled):
     candidate = _load_candidate_module()
@@ -8345,7 +8404,7 @@ def test_candidate_dense_tail_projection_passes_scaled_dense_cases(n, cond, cut,
 def test_candidate_tail_policy_env_overrides(monkeypatch):
     candidate = _load_candidate_module()
 
-    assert candidate._dense_tail_cut(512) == 32
+    assert candidate._dense_tail_cut(512) == 16
     assert candidate._dense_tail_cut(1024) == 64
     assert candidate._dense_tail_cut(2048) == 64
     assert candidate._dense_tail_cut(4096) == 128
@@ -9049,8 +9108,8 @@ def test_candidate_policy_reports_public_benchmark_routes():
     assert rows[3]["primary"] == "blocked_cuda_auto_or_fallback"
     assert rows[3]["case_specific_primary"] == "dense_tail_projection_or_fallback"
     assert rows[3]["active_cols"] == "auto_policy"
-    assert rows[3]["case_specific_active_cols"] == 480
-    assert rows[3]["dense_tail"] == {"cut": 32, "rank": 480, "threshold": 3.0e-2, "force": False}
+    assert rows[3]["case_specific_active_cols"] == 496
+    assert rows[3]["dense_tail"] == {"cut": 16, "rank": 496, "threshold": 3.0e-2, "force": False}
     assert rows[3]["required_cuda_kernel"] == "qr512_blocked_householder_r_maintenance"
     assert rows[3]["required_repair_modes"] == ["panel_refresh_mode=prefix", "r_maintenance_mode=panel-prefix"]
     assert rows[3]["candidate_config_shape_label"] == "qr512"
@@ -9894,19 +9953,19 @@ def test_large_kernel_plan_generates_tuner_compatible_configs(tmp_path):
     assert len(current512) == 8
     assert current512[0]["mode"] == "current-candidate"
     assert current512[0]["effective_only"] is True
-    assert current512[0]["seed_name"] == "b200_default_sync_free_compact_wy_frontload_2cta"
+    assert current512[0]["seed_name"] == "b200_default_reflector_frontload_2cta"
     assert current512[0]["env"]["FAST_QR_QR512_PANEL_B"] == "32"
     assert current512[0]["env"]["FAST_QR_QR512_TILE_N"] == "128"
     assert current512[0]["env"]["FAST_QR_QR512_PANEL_REFRESH_MODE"] == "prefix"
     assert current512[0]["env"]["FAST_QR_QR512_R_MAINTENANCE_MODE"] == "panel-prefix"
-    assert current512[0]["env"]["FAST_QR_QR512_UPDATE_MODE"] == "compact-wy"
+    assert current512[0]["env"]["FAST_QR_QR512_UPDATE_MODE"] == "reflectors"
     assert current512[0]["env"]["FAST_QR_QR512_CTAS_PER_MATRIX"] == "2"
     assert current512[0]["env"]["FAST_QR_QR512_CTA_SCHEDULE"] == "frontload"
-    assert current512[0]["env"]["FAST_QR_QR512_SYNC_FREE_AUTO_POLICY"] == "1"
+    assert current512[0]["env"]["FAST_QR_QR512_SYNC_FREE_AUTO_POLICY"] == "0"
     assert current512[0]["env"]["FAST_QR_QR512_BLOCKED_AUTO_GROUPS"] == "1"
     assert current512[0]["env"]["FAST_QR_QR512_POLICY_FULL_SCAN"] == "1"
     assert current512[0]["env"]["FAST_QR_QR512_STRUCTURED_BEFORE_CUDA"] == "0"
-    assert current512[0]["env"]["FAST_QR_QR512_TAIL_CUT"] == "32"
+    assert current512[0]["env"]["FAST_QR_QR512_TAIL_CUT"] == "16"
     assert current512[0]["env"]["FAST_QR_QR512_TAIL_FORCE"] == "0"
     assert current512[1]["seed_name"] == "sync_free_repair"
     assert current512[1]["env"]["FAST_QR_QR512_SYNC_FREE_AUTO_POLICY"] == "1"
@@ -9966,7 +10025,7 @@ def test_large_kernel_plan_generates_tuner_compatible_configs(tmp_path):
     )
     assert {row["env"]["FAST_QR_QR512_PANEL_REFRESH_MODE"] for row in repair_only512} == {"prefix"}
     assert {row["env"]["FAST_QR_QR512_R_MAINTENANCE_MODE"] for row in repair_only512} == {"panel-prefix"}
-    assert repair_only512[0]["seed_name"] == "b200_default_sync_free_compact_wy_frontload_2cta"
+    assert repair_only512[0]["seed_name"] == "b200_default_reflector_frontload_2cta"
     with pytest.raises(ValueError):
         generate_large_kernel_configs("qr512", axis_overrides={"not_an_axis": ["1"]})
 

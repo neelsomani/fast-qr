@@ -225,10 +225,10 @@ CURRENT_CANDIDATE_STATIC_ENV = {
 CURRENT_CANDIDATE_SEED_AXIS_VALUES: dict[str, list[tuple[str, dict[str, str]]]] = {
     "qr512": [
         (
-            "b200_default_sync_free_compact_wy_frontload_2cta",
+            "b200_default_reflector_frontload_2cta",
             {
                 "panel_widths": "32",
-                "update_modes": "compact-wy",
+                "update_modes": "reflectors",
                 "precision_modes": "fp32",
                 "panel_refresh_modes": "prefix",
                 "r_maintenance_modes": "panel-prefix",
@@ -237,10 +237,10 @@ CURRENT_CANDIDATE_SEED_AXIS_VALUES: dict[str, list[tuple[str, dict[str, str]]]] 
                 "warps_per_cta": "8",
                 "ctas_per_matrix": "2",
                 "cta_schedules": "frontload",
-                "sync_free_auto_policy": "1",
+                "sync_free_auto_policy": "0",
                 "auto_policy_groups": "1",
                 "policy_full_scan": "1",
-                "tail_cuts": "32",
+                "tail_cuts": "16",
                 "tail_thresholds": "0.03",
                 "structured_before_cuda": "0",
             },

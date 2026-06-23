@@ -4187,7 +4187,10 @@ def _blocked_auto_policy_grouping_enabled(data: torch.Tensor, n: int) -> bool:
     return n in (512, 1024, 2048, 4096) and _b200_default_blocked_cuda_enabled(data, n)
 
 
-def _blocked_sync_free_auto_policy_enabled_for_aliases(prefixes: tuple[str, ...]) -> bool:
+def _blocked_sync_free_auto_policy_enabled_for_aliases(
+    prefixes: tuple[str, ...],
+    default: bool | None = None,
+) -> bool:
     for prefix in prefixes:
         key = f"{prefix}_SYNC_FREE_AUTO_POLICY"
         raw = os.environ.get(key)
@@ -4202,6 +4205,8 @@ def _blocked_sync_free_auto_policy_enabled_for_aliases(prefixes: tuple[str, ...]
     if raw_enable is not None and raw_enable.strip() != "":
         return _env_truthy("FAST_QR_ENABLE_BLOCKED_SYNC_FREE_AUTO_POLICY")
 
+    if default is not None:
+        return bool(default)
     return _b200_default_blocked_repair_enabled()
 
 
@@ -4294,7 +4299,9 @@ def _route_config_fingerprint() -> tuple:
         os.environ.get("FAST_QR_REQUIRE_QR32_CUDA") == "1",
         os.environ.get("FAST_QR_REQUIRE_QR176_CUDA") == "1",
         os.environ.get("FAST_QR_REQUIRE_QR352_CUDA") == "1",
+        os.environ.get("FAST_QR_ENABLE_QR512_CUDA"),
         os.environ.get("FAST_QR_REQUIRE_QR512_CUDA") == "1",
+        os.environ.get("FAST_QR_ENABLE_QR1024_CUDA"),
         os.environ.get("FAST_QR_REQUIRE_QR1024_CUDA") == "1",
         os.environ.get("FAST_QR_DISABLE_QR32_CUDA") == "1",
         os.environ.get("FAST_QR_DISABLE_QR512_CUDA") == "1",
@@ -4787,6 +4794,10 @@ def _qr512_cuda_required() -> bool:
     return os.environ.get("FAST_QR_REQUIRE_QR512_CUDA") == "1"
 
 
+def _qr512_cuda_enabled() -> bool:
+    return _qr512_cuda_required() or _env_truthy("FAST_QR_ENABLE_QR512_CUDA")
+
+
 def _qr512_blocked_cuda_required() -> bool:
     return os.environ.get("FAST_QR_REQUIRE_QR512_BLOCKED_CUDA") == "1"
 
@@ -4801,9 +4812,11 @@ def _qr512_blocked_cuda_enabled() -> bool:
 def _qr512_blocked_cuda_enabled_for(data: torch.Tensor | None = None) -> bool:
     if _qr512_blocked_cuda_enabled():
         return True
+    if _qr512_blocked_cuda_required():
+        return True
     if data is None:
         return False
-    return _b200_default_blocked_cuda_enabled(data, 512)
+    return False
 
 
 def _qr512_blocked_cuda_extra_cuda_cflags() -> list[str]:
@@ -4867,7 +4880,7 @@ def _qr512_blocked_cuda_precision_mode() -> str:
 def _qr512_blocked_cuda_update_mode() -> str:
     return _update_mode_for_aliases(
         ("FAST_QR_QR512_BLOCKED", "FAST_QR_QR512"),
-        default=_blocked_update_mode_default(),
+        default="reflectors",
     )
 
 
@@ -4894,7 +4907,10 @@ def _qr512_blocked_cuda_r_maintenance_period() -> int:
 
 
 def _qr512_blocked_cuda_sync_free_auto_policy() -> bool:
-    return _blocked_sync_free_auto_policy_enabled_for_aliases(("FAST_QR_QR512_BLOCKED", "FAST_QR_QR512"))
+    return _blocked_sync_free_auto_policy_enabled_for_aliases(
+        ("FAST_QR_QR512_BLOCKED", "FAST_QR_QR512"),
+        default=False,
+    )
 
 
 def _blocked_cuda_source_config(n: int) -> tuple:
@@ -5677,7 +5693,8 @@ def _qr512_cuda_fast(data: torch.Tensor) -> output_t:
 
 def _qr512_cuda_route_enabled(data: torch.Tensor) -> bool:
     return (
-        os.environ.get("FAST_QR_DISABLE_QR512_CUDA") != "1"
+        _qr512_cuda_enabled()
+        and os.environ.get("FAST_QR_DISABLE_QR512_CUDA") != "1"
         and data.is_cuda
         and data.dtype == torch.float32
         and data.ndim == 3
@@ -5687,6 +5704,10 @@ def _qr512_cuda_route_enabled(data: torch.Tensor) -> bool:
 
 def _qr1024_cuda_required() -> bool:
     return os.environ.get("FAST_QR_REQUIRE_QR1024_CUDA") == "1"
+
+
+def _qr1024_cuda_enabled() -> bool:
+    return _qr1024_cuda_required() or _env_truthy("FAST_QR_ENABLE_QR1024_CUDA")
 
 
 def _qr1024_blocked_cuda_required() -> bool:
@@ -5703,9 +5724,11 @@ def _qr1024_blocked_cuda_enabled() -> bool:
 def _qr1024_blocked_cuda_enabled_for(data: torch.Tensor | None = None) -> bool:
     if _qr1024_blocked_cuda_enabled():
         return True
+    if _qr1024_blocked_cuda_required():
+        return True
     if data is None:
         return False
-    return _b200_default_blocked_cuda_enabled(data, 1024)
+    return False
 
 
 def _qr1024_blocked_cuda_extra_cuda_cflags() -> list[str]:
@@ -6903,7 +6926,8 @@ def _qr1024_cuda_fast(data: torch.Tensor) -> output_t:
 
 def _qr1024_cuda_route_enabled(data: torch.Tensor) -> bool:
     return (
-        os.environ.get("FAST_QR_DISABLE_QR1024_CUDA") != "1"
+        _qr1024_cuda_enabled()
+        and os.environ.get("FAST_QR_DISABLE_QR1024_CUDA") != "1"
         and data.is_cuda
         and data.dtype == torch.float32
         and data.ndim == 3
@@ -7053,7 +7077,7 @@ def _env_float_override(base_name: str, n: int, default: float, aliases: tuple[s
 def _dense_tail_cut(n: int) -> int:
     default = 0
     if n == 512:
-        default = 32
+        default = 16
     elif n == 1024:
         default = 64
     elif n == 2048:
