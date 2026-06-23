@@ -101,6 +101,14 @@ def _structured_before_cuda(candidate, n: int) -> bool:
     return False
 
 
+def _mark_blocked_auto_current_primary(row: dict[str, Any]) -> None:
+    row["case_specific_primary"] = row.get("primary")
+    if "active_cols" in row:
+        row["case_specific_active_cols"] = row["active_cols"]
+    row["primary"] = "blocked_cuda_auto_or_fallback"
+    row["active_cols"] = "auto_policy"
+
+
 def policy_for_spec(candidate, spec: dict[str, Any]) -> dict[str, Any]:
     batch = int(spec["batch"])
     n = int(spec["n"])
@@ -204,6 +212,8 @@ def policy_for_spec(candidate, spec: dict[str, Any]) -> dict[str, Any]:
         else:
             row["primary"] = "dense_tail_projection_or_fallback"
             row["active_cols"] = n - int(row["dense_tail"]["cut"])
+        if row["cuda_route_bypasses_classifier"]:
+            _mark_blocked_auto_current_primary(row)
     elif n == 1024:
         rank = int(candidate._rankdef_effective_cols(n))
         row.update(
@@ -262,11 +272,13 @@ def policy_for_spec(candidate, spec: dict[str, Any]) -> dict[str, Any]:
         else:
             row["primary"] = "dense_tail_projection_or_fallback"
             row["active_cols"] = n - int(row["dense_tail"]["cut"])
+        if row["cuda_route_bypasses_classifier"]:
+            _mark_blocked_auto_current_primary(row)
     elif batch == 8 and n == 2048:
         row.update(
             {
                 "dispatch": "qr2048_fast",
-                "primary": "dense_tail_projection_or_fallback",
+                "primary": "blocked_cuda_auto_or_fallback",
                 "blocked_cuda_route": "qr2048_blocked_cuda_auto_fast",
                 "blocked_cuda_base_route": "qr2048_blocked_cuda_fast",
                 "blocked_cuda_kernel": "geqrf2048_blocked_kernel",
@@ -282,12 +294,14 @@ def policy_for_spec(candidate, spec: dict[str, Any]) -> dict[str, Any]:
                 "candidate_config_correctness_indices": "16,21",
             }
         )
-        row["active_cols"] = n - int(row["dense_tail"]["cut"])
+        row["case_specific_primary"] = "dense_tail_projection_or_fallback"
+        row["case_specific_active_cols"] = n - int(row["dense_tail"]["cut"])
+        row["active_cols"] = "auto_policy"
     elif batch == 2 and n == 4096:
         row.update(
             {
                 "dispatch": "qr4096_fast",
-                "primary": "dense_tail_projection_or_fallback",
+                "primary": "blocked_cuda_auto_or_fallback",
                 "blocked_cuda_route": "qr4096_blocked_cuda_auto_fast",
                 "blocked_cuda_base_route": "qr4096_blocked_cuda_fast",
                 "blocked_cuda_kernel": "geqrf4096_blocked_kernel",
@@ -303,7 +317,9 @@ def policy_for_spec(candidate, spec: dict[str, Any]) -> dict[str, Any]:
                 "candidate_config_correctness_indices": "5,18",
             }
         )
-        row["active_cols"] = n - int(row["dense_tail"]["cut"])
+        row["case_specific_primary"] = "dense_tail_projection_or_fallback"
+        row["case_specific_active_cols"] = n - int(row["dense_tail"]["cut"])
+        row["active_cols"] = "auto_policy"
     else:
         row.update({"dispatch": "fallback", "primary": "torch.geqrf"})
 

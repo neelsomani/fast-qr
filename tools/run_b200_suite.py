@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import selectors
 import subprocess
 import sys
 import tarfile
@@ -78,26 +79,64 @@ def timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def run_command(cmd: list[str], log_path: Path, env: dict[str, str]) -> None:
+def run_command(cmd: list[str], log_path: Path, env: dict[str, str], timeout_s: float | None = None) -> None:
     print(f"\n$ {' '.join(cmd)}", flush=True)
     start = time.perf_counter()
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n$ {' '.join(cmd)}\n")
         log.flush()
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=ROOT,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
         )
-        log.write(completed.stdout)
-        log.write(f"\nexit_code={completed.returncode}; elapsed_s={time.perf_counter() - start:.3f}\n")
-    print(completed.stdout, end="")
-    if completed.returncode != 0:
-        raise RuntimeError(f"command failed with exit code {completed.returncode}: {' '.join(cmd)}")
+        assert proc.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        timed_out = False
+        returncode = 0
+        try:
+            while True:
+                elapsed_s = time.perf_counter() - start
+                if timeout_s is not None and elapsed_s > timeout_s:
+                    timed_out = True
+                    break
+                for key, _ in selector.select(timeout=1.0):
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        break
+                    text = chunk.decode("utf-8", errors="replace")
+                    log.write(text)
+                    log.flush()
+                    print(text, end="", flush=True)
+                if proc.poll() is not None:
+                    for chunk in iter(lambda: os.read(proc.stdout.fileno(), 65536), b""):
+                        text = chunk.decode("utf-8", errors="replace")
+                        log.write(text)
+                        log.flush()
+                        print(text, end="", flush=True)
+                    break
+            if timed_out:
+                message = f"\ncommand timed out after {timeout_s:.1f}s\n"
+                log.write(message)
+                log.flush()
+                print(message, end="", flush=True)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10.0)
+                raise TimeoutError(f"command timed out after {timeout_s:.1f}s: {' '.join(cmd)}")
+            returncode = proc.wait()
+        finally:
+            selector.close()
+        log.write(f"\nexit_code={returncode}; elapsed_s={time.perf_counter() - start:.3f}\n")
+    if returncode != 0:
+        raise RuntimeError(f"command failed with exit code {returncode}: {' '.join(cmd)}")
 
 
 def append_manifest(manifest_path: Path, row: dict) -> None:
@@ -258,26 +297,44 @@ def _required_kernel_priority(case_index: int, row: dict) -> tuple[int, int]:
 
 
 def candidate_config_next_required_target(args: argparse.Namespace) -> dict:
+    targets = candidate_config_required_targets(args)
+    if not targets:
+        raise ValueError("candidate policy has no rows with required_cuda_kernel and candidate_config_shape_label")
+    return targets[0]
+
+
+def candidate_config_required_targets(args: argparse.Namespace) -> list[dict]:
     from candidate_policy import policy_rows
 
-    cases_path = (
-        ROOT / args.candidate_config_tune_benchmark_cases
-        if not Path(args.candidate_config_tune_benchmark_cases).is_absolute()
-        else Path(args.candidate_config_tune_benchmark_cases)
+    benchmark_cases = getattr(args, "candidate_config_tune_benchmark_cases", "cases/public_benchmarks.txt")
+    cases_path = ROOT / benchmark_cases if not Path(benchmark_cases).is_absolute() else Path(benchmark_cases)
+    rows = policy_rows(getattr(args, "submission", "submissions/candidate.py"), cases_path)
+    candidates = sorted(
+        [
+            (case_index, row)
+            for case_index, row in enumerate(rows)
+            if row.get("required_cuda_kernel") and row.get("candidate_config_shape_label")
+        ],
+        key=lambda item: _required_kernel_priority(*item),
     )
-    rows = policy_rows(args.submission, cases_path)
-    candidates = [
-        (case_index, row)
-        for case_index, row in enumerate(rows)
-        if row.get("required_cuda_kernel") and row.get("candidate_config_shape_label")
-    ]
-    if not candidates:
-        raise ValueError("candidate policy has no rows with required_cuda_kernel and candidate_config_shape_label")
-    case_index, row = sorted(candidates, key=lambda item: _required_kernel_priority(*item))[0]
+    targets_by_shape: dict[str, dict] = {}
+    for case_index, row in candidates:
+        shape_label = str(row["candidate_config_shape_label"])
+        if shape_label in targets_by_shape:
+            targets_by_shape[shape_label]["source_case_indices"].append(case_index)
+            targets_by_shape[shape_label]["source_specs"].append(row.get("spec"))
+            continue
+        targets_by_shape[shape_label] = _candidate_config_target_from_policy_row(case_index, row)
+    return list(targets_by_shape.values())
+
+
+def _candidate_config_target_from_policy_row(case_index: int, row: dict) -> dict:
     return {
         "source": "candidate_policy",
         "case_index": case_index,
+        "source_case_indices": [case_index],
         "spec": row.get("spec"),
+        "source_specs": [row.get("spec")],
         "shape_label": row["candidate_config_shape_label"],
         "env_prefix": row.get("candidate_config_env_prefix"),
         "benchmark_indices": row.get("candidate_config_benchmark_indices", ""),
@@ -285,6 +342,41 @@ def candidate_config_next_required_target(args: argparse.Namespace) -> dict:
         "required_cuda_kernel": row.get("required_cuda_kernel"),
         "required_repair_modes": row.get("required_repair_modes", []),
     }
+
+
+def candidate_config_tune_command_for_target(
+    target: dict,
+    *,
+    suite_name: str,
+    max_configs: int = 8,
+    mode: str = "current-candidate",
+    python: str = "python",
+) -> list[str]:
+    command = [
+        python,
+        "tools/run_b200_suite.py",
+        "--suite-name",
+        suite_name,
+        "--include-candidate-config-tune",
+        "--candidate-config-tune-shape-label",
+        str(target["shape_label"]),
+        "--candidate-config-tune-large-kernel-plan-mode",
+        mode,
+        "--candidate-config-tune-large-kernel-plan-max-configs",
+        str(max_configs),
+    ]
+    if target.get("env_prefix"):
+        command.extend(["--candidate-config-tune-env-prefix", str(target["env_prefix"])])
+    if target.get("correctness_indices"):
+        command.extend(["--candidate-config-tune-correctness-indices", str(target["correctness_indices"])])
+    if target.get("benchmark_indices"):
+        command.extend(["--candidate-config-tune-benchmark-indices", str(target["benchmark_indices"])])
+    for axis, value in _repair_mode_axis_constraints(target.get("required_repair_modes", [])).items():
+        if axis == "panel_refresh_modes":
+            command.extend(["--candidate-config-tune-panel-refresh-modes", value])
+        elif axis == "r_maintenance_modes":
+            command.extend(["--candidate-config-tune-r-maintenance-modes", value])
+    return command
 
 
 def _csv_override_values(raw: object) -> list[str]:
@@ -389,6 +481,15 @@ def write_candidate_config_tune_large_kernel_plan(args: argparse.Namespace, suit
     path = candidate_config_tune_large_kernel_plan_path(suite_dir)
     write_large_kernel_config_jsonl(path, rows)
     return path, rows
+
+
+def step_timeout_s(step_name: str, args: argparse.Namespace) -> float | None:
+    if step_name != "pytest":
+        return None
+    timeout_s = getattr(args, "pytest_timeout_s", None)
+    if timeout_s is None or timeout_s <= 0:
+        return None
+    return float(timeout_s)
 
 
 def candidate_config_tune_large_kernel_plan_preview(args: argparse.Namespace, suite_dir: Path) -> dict | None:
@@ -1037,9 +1138,17 @@ def main() -> int:
     parser.add_argument("--popcorn-bin", default="popcorn")
     parser.add_argument("--popcorn-timeout-s", type=float, default=None)
     parser.add_argument("--popcorn-seed", type=int, default=None)
+    parser.add_argument(
+        "--pytest-timeout-s",
+        type=float,
+        default=1800.0,
+        help="Timeout for the pytest suite step. Defaults to 1800 seconds; pass 0 to disable.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the suite command plan without creating results or running commands.")
-    parser.add_argument("--dry-run-json", action="store_true", help="With --dry-run, print the command plan as JSON.")
+    parser.add_argument("--dry-run-json", action="store_true", help="Print the dry-run command plan as JSON; implies --dry-run.")
     args = parser.parse_args()
+    if args.dry_run_json:
+        args.dry_run = True
     args.candidate_config_tune_policy_target = None
     if args.candidate_config_tune_next_required:
         args.include_candidate_config_tune = True
@@ -1928,7 +2037,7 @@ def main() -> int:
                     "time": datetime.now().isoformat(),
                 },
             )
-            run_command(cmd, log_path, merged_env(env, env_overrides))
+            run_command(cmd, log_path, merged_env(env, env_overrides), timeout_s=step_timeout_s(step_name, args))
             append_manifest(
                 manifest_path,
                 {

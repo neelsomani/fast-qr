@@ -102,6 +102,15 @@ def expected_mixed_route(spec: dict[str, Any]) -> str | None:
     return None
 
 
+def allowed_mixed_routes(spec: dict[str, Any]) -> set[str] | None:
+    n = int(spec["n"])
+    if n == 512:
+        return {"qr512_mixed_fast", "qr512_cuda_fast", "qr512_blocked_cuda_auto_fast"}
+    if n == 1024:
+        return {"qr1024_mixed_fast", "qr1024_cuda_fast", "qr1024_blocked_cuda_auto_fast"}
+    return None
+
+
 def actual_route_plan(candidate, data: torch.Tensor) -> tuple[str, dict[str, Any] | None]:
     if hasattr(candidate, "_route_plan_for_data"):
         route, plan = candidate._route_plan_for_data(data)
@@ -148,8 +157,9 @@ def run_case(
 
     good, message = check_implementation(data, output)
     expected_route = expected_mixed_route(spec)
+    allowed_routes = allowed_mixed_routes(spec)
     route_cuda_bypass = route in {"qr512_cuda_fast", "qr1024_cuda_fast"}
-    route_ok = expected_route is None or route == expected_route or route_cuda_bypass
+    route_ok = allowed_routes is None or route in allowed_routes
     row: dict[str, Any] = {
         "ok": good,
         "message": message,
@@ -163,6 +173,7 @@ def run_case(
         "device": str(data.device),
         "route": route,
         "expected_route": expected_route,
+        "allowed_routes": sorted(allowed_routes) if allowed_routes is not None else None,
         "route_ok": bool(route_ok),
         "route_cuda_bypass": bool(route_cuda_bypass),
         "sampled_class": cls,

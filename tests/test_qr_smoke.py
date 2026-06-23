@@ -50,7 +50,11 @@ from experiments import (  # noqa: E402
     parse_experiments,
 )
 from quantization_seed_sweep import run_case as run_quantization_case, summarize as summarize_quantization_sweep  # noqa: E402
-from mixed_seed_sweep import run_case as run_mixed_seed_case, summarize as summarize_mixed_seed_sweep  # noqa: E402
+from mixed_seed_sweep import (  # noqa: E402
+    allowed_mixed_routes,
+    run_case as run_mixed_seed_case,
+    summarize as summarize_mixed_seed_sweep,
+)
 from implementation_status import readiness_rows, summarize_readiness  # noqa: E402
 from large_kernel_plan import generate_configs as generate_large_kernel_configs, tune_command as large_kernel_tune_command  # noqa: E402
 from preflight_accelerators import (  # noqa: E402
@@ -70,6 +74,8 @@ from run_b200_suite import (  # noqa: E402
     apply_suite_env_options,
     candidate_config_accelerator_for_shape,
     candidate_config_accelerator_preflight_path,
+    candidate_config_required_targets,
+    candidate_config_tune_command_for_target,
     candidate_config_tune_large_kernel_plan_path,
     candidate_config_tune_large_kernel_plan_rows,
     default_validation_blockers,
@@ -119,6 +125,7 @@ from validate_local_checks import EXPECTED_STEPS as LOCAL_EXPECTED_STEPS  # noqa
 from validate_local_checks import REQUIRED_FILES as LOCAL_REQUIRED_FILES, validate_local_checks  # noqa: E402
 from validate_submission import validate_submission  # noqa: E402
 from run_local_checks import next_required_b200_summary  # noqa: E402
+from print_b200_tuning_plan import build_rows as build_b200_tuning_plan_rows  # noqa: E402
 from analyze_b200_results import (  # noqa: E402
     analyze_large_cuda_probe_ablation,
     analyze_suite,
@@ -837,6 +844,66 @@ def test_b200_suite_candidate_config_tune_next_required_auto_targets_qr512(tmp_p
             "FAST_QR_QR512_WARPS_PER_CTA",
         ),
     }
+
+
+def test_b200_required_tuning_targets_cover_all_remaining_large_shapes():
+    args = SimpleNamespace(
+        candidate_config_tune_benchmark_cases="cases/public_benchmarks.txt",
+        submission="submissions/candidate.py",
+    )
+    targets = candidate_config_required_targets(args)
+    assert [row["shape_label"] for row in targets] == ["qr512", "qr1024", "qr2048", "qr4096"]
+    assert [row["source_case_indices"] for row in targets] == [[3, 7, 9, 10], [4, 8, 11], [5], [6]]
+    assert [row["benchmark_indices"] for row in targets] == ["3,7,9,10", "4,8,11", "5", "6"]
+    assert [row["correctness_indices"] for row in targets] == [
+        "3,6,7,8,9,10,11,19",
+        "4,12,13,14,15,20",
+        "16,21",
+        "5,18",
+    ]
+
+
+def test_b200_required_tuning_command_includes_shape_constraints():
+    args = SimpleNamespace(
+        candidate_config_tune_benchmark_cases="cases/public_benchmarks.txt",
+        submission="submissions/candidate.py",
+    )
+    target = candidate_config_required_targets(args)[1]
+    cmd = candidate_config_tune_command_for_target(
+        target,
+        suite_name="pytest_required_qr1024",
+        max_configs=8,
+        mode="current-candidate",
+        python=sys.executable,
+    )
+    assert cmd[:3] == [sys.executable, "tools/run_b200_suite.py", "--suite-name"]
+    assert cmd[cmd.index("--candidate-config-tune-shape-label") + 1] == "qr1024"
+    assert cmd[cmd.index("--candidate-config-tune-env-prefix") + 1] == "FAST_QR_QR1024"
+    assert cmd[cmd.index("--candidate-config-tune-correctness-indices") + 1] == "4,12,13,14,15,20"
+    assert cmd[cmd.index("--candidate-config-tune-benchmark-indices") + 1] == "4,8,11"
+    assert cmd[cmd.index("--candidate-config-tune-large-kernel-plan-max-configs") + 1] == "8"
+    assert cmd[cmd.index("--candidate-config-tune-panel-refresh-modes") + 1] == "prefix"
+    assert cmd[cmd.index("--candidate-config-tune-r-maintenance-modes") + 1] == "panel-prefix"
+
+
+def test_print_b200_tuning_plan_rows_match_required_targets():
+    args = SimpleNamespace(
+        candidate_config_tune_benchmark_cases="cases/public_benchmarks.txt",
+        submission="submissions/candidate.py",
+        suite_prefix="pytest_required",
+        max_configs=8,
+        mode="current-candidate",
+        python="python",
+    )
+    rows = build_b200_tuning_plan_rows(args)
+    assert [row["shape_label"] for row in rows] == ["qr512", "qr1024", "qr2048", "qr4096"]
+    assert rows[0]["suite_name"] == "pytest_required_1_qr512"
+    assert rows[0]["source_case_indices"] == [3, 7, 9, 10]
+    assert rows[0]["required_repair_modes"] == ["panel_refresh_mode=prefix", "r_maintenance_mode=panel-prefix"]
+    assert "--candidate-config-tune-shape-label qr512" in rows[0]["shell_command"]
+    assert "--candidate-config-tune-benchmark-indices 3,7,9,10" in rows[0]["shell_command"]
+    assert rows[2]["source_case_indices"] == [5]
+    assert "--candidate-config-tune-shape-label qr2048" in rows[2]["shell_command"]
 
 
 def test_b200_suite_dry_run_can_include_blocked_qr_sweep(tmp_path):
@@ -3934,6 +4001,10 @@ def test_b200_default_promotes_blocked_cuda_routes(monkeypatch):
     assert candidate._qr1024_blocked_cuda_route_enabled(fakes[1024])
     assert candidate._qr2048_blocked_cuda_route_enabled(fakes[2048])
     assert candidate._qr4096_blocked_cuda_route_enabled(fakes[4096])
+    assert candidate._blocked_cuda_auto_route_enabled(fakes[512], 512)
+    assert candidate._blocked_cuda_auto_route_enabled(fakes[1024], 1024)
+    assert candidate._blocked_cuda_auto_route_enabled(fakes[2048], 2048)
+    assert candidate._blocked_cuda_auto_route_enabled(fakes[4096], 4096)
     assert candidate._qr32_cuda_warps_per_cta() == 8
     assert candidate._qr32_cuda_threads_per_cta() == 256
     assert candidate._qr176_cuda_update_col_tile() == 16
@@ -4048,6 +4119,14 @@ def test_b200_default_promotes_blocked_cuda_routes(monkeypatch):
     monkeypatch.setenv("FAST_QR_ENABLE_QR512_BLOCKED_CUDA", "1")
     monkeypatch.setenv("FAST_QR_DISABLE_QR512_BLOCKED_AUTO_POLICY", "1")
     assert candidate._compute_route_plan(fakes[512]) == ("qr512_blocked_cuda_fast", None)
+    assert not candidate._blocked_cuda_auto_route_enabled(fakes[512], 512)
+
+    monkeypatch.delenv("FAST_QR_DISABLE_QR512_BLOCKED_AUTO_POLICY")
+    monkeypatch.setenv("FAST_QR_ENABLE_QR512_BLOCKED_AUTO_POLICY", "0")
+    assert not candidate._blocked_cuda_auto_route_enabled(fakes[512], 512)
+
+    monkeypatch.setenv("FAST_QR_ENABLE_QR512_BLOCKED_AUTO_POLICY", "1")
+    assert candidate._blocked_cuda_auto_route_enabled(fakes[512], 512)
 
 
 def test_b200_default_uses_blocked_cuda_first_and_structured_first_is_opt_in(monkeypatch):
@@ -4403,27 +4482,104 @@ def test_custom_kernel_unique_public_shapes_bypass_route_planning(monkeypatch, b
 
 
 @pytest.mark.parametrize(
-    ("batch", "n", "blocked_route_name", "auto_name"),
+    ("batch", "n", "fast_name", "private_name"),
     [
-        (640, 512, "_qr512_blocked_cuda_route_enabled", "qr512_blocked_cuda_auto_fast"),
-        (60, 1024, "_qr1024_blocked_cuda_route_enabled", "qr1024_blocked_cuda_auto_fast"),
+        (20, 32, "qr32_fast", "_qr32_cuda_public_fast"),
+        (40, 176, "qr176_fast", "_qr176_cuda_public_fast"),
+        (40, 352, "qr352_fast", "_qr352_cuda_public_fast"),
+    ],
+)
+def test_custom_kernel_small_public_cuda_shapes_bypass_wrapper(
+    monkeypatch,
+    batch,
+    n,
+    fast_name,
+    private_name,
+):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(batch, n, n), is_cuda=True, dtype=torch.float32)
+    sentinel = object()
+
+    monkeypatch.setattr(candidate, private_name, lambda _data: sentinel)
+    monkeypatch.setattr(
+        candidate,
+        fast_name,
+        lambda _data: (_ for _ in ()).throw(AssertionError("small CUDA public hot path should bypass wrapper")),
+    )
+    monkeypatch.setattr(
+        candidate,
+        "_route_plan_for_data",
+        lambda _data: (_ for _ in ()).throw(AssertionError("small public shapes should not route-plan")),
+    )
+
+    assert candidate.custom_kernel(data) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("batch", "n", "fast_name", "private_name"),
+    [
+        (20, 32, "qr32_fast", "_qr32_cuda_public_fast"),
+        (40, 176, "qr176_fast", "_qr176_cuda_public_fast"),
+        (40, 352, "qr352_fast", "_qr352_cuda_public_fast"),
+    ],
+)
+def test_custom_kernel_small_public_cuda_shapes_keep_wrapper_for_non_float32(
+    monkeypatch,
+    batch,
+    n,
+    fast_name,
+    private_name,
+):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(batch, n, n), is_cuda=True, dtype=torch.float64)
+    sentinel = object()
+
+    monkeypatch.setattr(candidate, fast_name, lambda _data: sentinel)
+    monkeypatch.setattr(
+        candidate,
+        private_name,
+        lambda _data: (_ for _ in ()).throw(AssertionError("non-float32 tensors should use wrapper fallback")),
+    )
+
+    assert candidate.custom_kernel(data) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("batch", "n", "auto_name", "private_name"),
+    [
+        (
+            640,
+            512,
+            "qr512_blocked_cuda_auto_fast",
+            "_qr512_blocked_cuda_auto_public_fast",
+        ),
+        (
+            60,
+            1024,
+            "qr1024_blocked_cuda_auto_fast",
+            "_qr1024_blocked_cuda_auto_public_fast",
+        ),
     ],
 )
 def test_custom_kernel_public_ambiguous_shapes_bypass_route_planning_on_b200_cuda_first(
     monkeypatch,
     batch,
     n,
-    blocked_route_name,
     auto_name,
+    private_name,
 ):
     candidate = _load_candidate_module()
     data = SimpleNamespace(shape=(batch, n, n))
     sentinel = object()
 
     monkeypatch.setattr(candidate, "_structured_before_cuda", lambda shape_n: False)
-    monkeypatch.setattr(candidate, blocked_route_name, lambda _data: True)
-    monkeypatch.setattr(candidate, "_blocked_auto_policy_enabled", lambda _data, shape_n: shape_n == n)
-    monkeypatch.setattr(candidate, auto_name, lambda _data: sentinel)
+    monkeypatch.setattr(candidate, "_blocked_cuda_auto_route_enabled", lambda _data, shape_n: shape_n == n)
+    monkeypatch.setattr(candidate, private_name, lambda _data: sentinel)
+    monkeypatch.setattr(
+        candidate,
+        auto_name,
+        lambda _data: (_ for _ in ()).throw(AssertionError("B200 public hot path should bypass wrapper")),
+    )
     monkeypatch.setattr(
         candidate,
         "_route_plan_for_data",
@@ -4431,6 +4587,314 @@ def test_custom_kernel_public_ambiguous_shapes_bypass_route_planning_on_b200_cud
     )
 
     assert candidate.custom_kernel(data) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("batch", "n", "auto_name", "private_name", "fast_name"),
+    [
+        (
+            8,
+            2048,
+            "qr2048_blocked_cuda_auto_fast",
+            "_qr2048_blocked_cuda_auto_public_fast",
+            "qr2048_fast",
+        ),
+        (
+            2,
+            4096,
+            "qr4096_blocked_cuda_auto_fast",
+            "_qr4096_blocked_cuda_auto_public_fast",
+            "qr4096_fast",
+        ),
+    ],
+)
+def test_custom_kernel_large_public_shapes_bypass_wrapper_on_b200_cuda_first(
+    monkeypatch,
+    batch,
+    n,
+    auto_name,
+    private_name,
+    fast_name,
+):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(batch, n, n), is_cuda=True)
+    sentinel = object()
+
+    monkeypatch.setenv(f"FAST_QR_QR{n}_TAIL_CUT", "64" if n == 2048 else "128")
+    monkeypatch.setattr(candidate, "_blocked_cuda_auto_route_enabled", lambda _data, shape_n: shape_n == n)
+    monkeypatch.setattr(candidate, private_name, lambda _data: sentinel)
+    monkeypatch.setattr(
+        candidate,
+        auto_name,
+        lambda _data: (_ for _ in ()).throw(AssertionError("B200 large public hot path should bypass wrapper")),
+    )
+    monkeypatch.setattr(
+        candidate,
+        fast_name,
+        lambda _data: (_ for _ in ()).throw(AssertionError("B200 large public hot path should bypass wrapper")),
+    )
+    monkeypatch.setattr(
+        candidate,
+        "_route_plan_for_data",
+        lambda _data: (_ for _ in ()).throw(AssertionError("B200 large public hot path should not route-plan")),
+    )
+
+    assert candidate.custom_kernel(data) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("public_name", "try_name", "fallback_name"),
+    [
+        (
+            "_qr512_blocked_cuda_auto_public_fast",
+            "_qr512_blocked_cuda_auto_try",
+            "_qr512_blocked_cuda_fast",
+        ),
+        (
+            "_qr1024_blocked_cuda_auto_public_fast",
+            "_qr1024_blocked_cuda_auto_try",
+            "_qr1024_blocked_cuda_fast",
+        ),
+    ],
+)
+def test_candidate_public_blocked_auto_entrypoints_trust_public_shape(
+    monkeypatch,
+    public_name,
+    try_name,
+    fallback_name,
+):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(1, 512, 512))
+    sentinel = object()
+    calls = []
+
+    def fake_try(data_arg, *, trusted_public_shape=False):
+        calls.append((data_arg, trusted_public_shape))
+        return sentinel
+
+    monkeypatch.setattr(candidate, try_name, fake_try)
+    monkeypatch.setattr(
+        candidate,
+        fallback_name,
+        lambda _data: (_ for _ in ()).throw(AssertionError("passing trusted path should not fall back")),
+    )
+
+    assert getattr(candidate, public_name)(data) is sentinel
+    assert calls == [(data, True)]
+
+
+@pytest.mark.parametrize(
+    ("public_name", "n"),
+    [
+        ("_qr2048_blocked_cuda_auto_public_fast", 2048),
+        ("_qr4096_blocked_cuda_auto_public_fast", 4096),
+    ],
+)
+def test_candidate_generic_public_blocked_auto_entrypoints_trust_public_shape(monkeypatch, public_name, n):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(1, n, n))
+    sentinel = object()
+    calls = []
+
+    def fake_try(data_arg, shape_n, *, trusted_public_shape=False):
+        calls.append((data_arg, shape_n, trusted_public_shape))
+        return sentinel
+
+    monkeypatch.setattr(candidate, "_generic_blocked_cuda_auto_try", fake_try)
+    monkeypatch.setattr(
+        candidate,
+        "_generic_blocked_cuda_fast",
+        lambda _data, _shape_n: (_ for _ in ()).throw(AssertionError("passing trusted path should not fall back")),
+    )
+
+    assert getattr(candidate, public_name)(data) is sentinel
+    assert calls == [(data, n, True)]
+
+
+@pytest.mark.parametrize(
+    ("public_name", "try_name", "fallback_name"),
+    [
+        (
+            "_qr512_blocked_cuda_auto_public_fast",
+            "_qr512_blocked_cuda_auto_try",
+            "_qr512_blocked_cuda_fast",
+        ),
+        (
+            "_qr1024_blocked_cuda_auto_public_fast",
+            "_qr1024_blocked_cuda_auto_try",
+            "_qr1024_blocked_cuda_fast",
+        ),
+    ],
+)
+def test_candidate_public_blocked_auto_entrypoints_keep_fallback(monkeypatch, public_name, try_name, fallback_name):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(1, 512, 512))
+    sentinel = object()
+
+    monkeypatch.setattr(candidate, try_name, lambda _data, *, trusted_public_shape=False: None)
+    monkeypatch.setattr(candidate, fallback_name, lambda _data: sentinel)
+
+    assert getattr(candidate, public_name)(data) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("public_name", "n"),
+    [
+        ("_qr2048_blocked_cuda_auto_public_fast", 2048),
+        ("_qr4096_blocked_cuda_auto_public_fast", 4096),
+    ],
+)
+def test_candidate_generic_public_blocked_auto_entrypoints_keep_fallback(monkeypatch, public_name, n):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(1, n, n))
+    sentinel = object()
+
+    monkeypatch.setattr(
+        candidate,
+        "_generic_blocked_cuda_auto_try",
+        lambda _data, _shape_n, *, trusted_public_shape=False: None,
+    )
+    monkeypatch.setattr(candidate, "_generic_blocked_cuda_fast", lambda _data, _shape_n: sentinel)
+
+    assert getattr(candidate, public_name)(data) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("blocked_fast_name", "blocked_try_name", "one_cta_try_name"),
+    [
+        ("_qr512_blocked_cuda_fast", "_qr512_blocked_cuda_try", "_qr512_cuda_try"),
+        ("_qr1024_blocked_cuda_fast", "_qr1024_blocked_cuda_try", "_qr1024_cuda_try"),
+    ],
+)
+def test_candidate_blocked_cuda_fast_falls_back_to_one_cta_before_geqrf(
+    monkeypatch,
+    blocked_fast_name,
+    blocked_try_name,
+    one_cta_try_name,
+):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace()
+    sentinel = object()
+
+    monkeypatch.setattr(candidate, blocked_try_name, lambda _data: None)
+    monkeypatch.setattr(candidate, one_cta_try_name, lambda _data: sentinel)
+    monkeypatch.setattr(
+        candidate,
+        "_geqrf_fallback",
+        lambda _data: (_ for _ in ()).throw(AssertionError("blocked fallback should try one-CTA CUDA first")),
+    )
+
+    assert getattr(candidate, blocked_fast_name)(data) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("blocked_fast_name", "blocked_try_name", "one_cta_try_name"),
+    [
+        ("_qr512_blocked_cuda_fast", "_qr512_blocked_cuda_try", "_qr512_cuda_try"),
+        ("_qr1024_blocked_cuda_fast", "_qr1024_blocked_cuda_try", "_qr1024_cuda_try"),
+    ],
+)
+def test_candidate_blocked_cuda_fast_keeps_successful_blocked_output(
+    monkeypatch,
+    blocked_fast_name,
+    blocked_try_name,
+    one_cta_try_name,
+):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace()
+    sentinel = object()
+
+    monkeypatch.setattr(candidate, blocked_try_name, lambda _data: sentinel)
+    monkeypatch.setattr(
+        candidate,
+        one_cta_try_name,
+        lambda _data: (_ for _ in ()).throw(AssertionError("successful blocked path should not try fallback")),
+    )
+
+    assert getattr(candidate, blocked_fast_name)(data) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("n", "blocked_fast_name", "blocked_try_name", "one_cta_try_name"),
+    [
+        (512, "_qr512_blocked_cuda_fast", "_qr512_blocked_cuda_try", "_qr512_cuda_try"),
+        (1024, "_qr1024_blocked_cuda_fast", "_qr1024_blocked_cuda_try", "_qr1024_cuda_try"),
+    ],
+)
+def test_candidate_blocked_cuda_fast_falls_back_to_dense_tail_after_one_cta_miss(
+    monkeypatch,
+    n,
+    blocked_fast_name,
+    blocked_try_name,
+    one_cta_try_name,
+):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(1, n, n))
+    sentinel = object()
+    calls = []
+
+    monkeypatch.setattr(candidate, blocked_try_name, lambda _data: None)
+    monkeypatch.setattr(candidate, one_cta_try_name, lambda _data: None)
+    monkeypatch.setattr(candidate, "_dense_tail_route_or_fallback", lambda _data, route: route)
+    monkeypatch.setattr(candidate, "_dense_tail_cut", lambda shape_n: 32 if shape_n == n else 0)
+
+    def embedded_tail(data_arg, rank):
+        calls.append((data_arg, rank))
+        return sentinel
+
+    monkeypatch.setattr(candidate, "_embedded_geqrf_with_tail_projection", embedded_tail)
+    monkeypatch.setattr(
+        candidate,
+        "_geqrf_fallback",
+        lambda _data: (_ for _ in ()).throw(AssertionError("dense-tail fallback should precede geqrf")),
+    )
+
+    assert getattr(candidate, blocked_fast_name)(data) is sentinel
+    assert calls == [(data, n - 32)]
+
+
+@pytest.mark.parametrize("n", [2048, 4096])
+def test_candidate_generic_blocked_cuda_fast_falls_back_to_dense_tail_before_geqrf(monkeypatch, n):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(1, n, n))
+    sentinel = object()
+    calls = []
+
+    monkeypatch.setattr(candidate, "_generic_blocked_cuda_try", lambda _data, shape_n: None)
+    monkeypatch.setattr(candidate, "_dense_tail_route_or_fallback", lambda _data, route: route)
+    monkeypatch.setattr(candidate, "_dense_tail_cut", lambda shape_n: 64 if shape_n == n else 0)
+
+    def embedded_tail(data_arg, rank):
+        calls.append((data_arg, rank))
+        return sentinel
+
+    monkeypatch.setattr(candidate, "_embedded_geqrf_with_tail_projection", embedded_tail)
+    monkeypatch.setattr(
+        candidate,
+        "_geqrf_fallback",
+        lambda _data: (_ for _ in ()).throw(AssertionError("dense-tail fallback should be used first")),
+    )
+
+    assert candidate._generic_blocked_cuda_fast(data, n) is sentinel
+    assert calls == [(data, n - 64)]
+
+
+@pytest.mark.parametrize("n", [2048, 4096])
+def test_candidate_generic_blocked_cuda_fast_keeps_geqrf_when_dense_tail_rejected(monkeypatch, n):
+    candidate = _load_candidate_module()
+    data = SimpleNamespace(shape=(1, n, n))
+    sentinel = object()
+
+    monkeypatch.setattr(candidate, "_generic_blocked_cuda_try", lambda _data, shape_n: None)
+    monkeypatch.setattr(candidate, "_dense_tail_route_or_fallback", lambda _data, _route: "torch.geqrf")
+    monkeypatch.setattr(
+        candidate,
+        "_embedded_geqrf_with_tail_projection",
+        lambda _data, _rank: (_ for _ in ()).throw(AssertionError("dense-tail fallback was rejected")),
+    )
+    monkeypatch.setattr(candidate, "_geqrf_fallback", lambda _data: sentinel)
+
+    assert candidate._generic_blocked_cuda_fast(data, n) is sentinel
 
 
 @pytest.mark.parametrize(
@@ -4862,7 +5326,9 @@ def test_candidate_blocked_cuda_update_col_end_is_on_trailing_kernel_signature()
         assert f"void geqrf{n}_blocked_indexed(" in cpp_source
         assert f"void geqrf{n}_blocked_auto_cuda(" in cpp_source
         assert f"void geqrf{n}_blocked_auto(" in cpp_source
+        assert f"void geqrf{n}_blocked_auto_workspace(" in cpp_source
         assert f"void geqrf{n}_blocked_make_policy_cuda(" in cpp_source
+        assert f"void geqrf{n}_blocked_make_policy_workspace_cuda(" in cpp_source
         assert f"void geqrf{n}_blocked_make_policy(" in cpp_source
         assert f"void geqrf{n}_blocked_make_policy_metadata_cuda(" in cpp_source
         assert f"void geqrf{n}_blocked_make_policy_metadata(" in cpp_source
@@ -4871,6 +5337,10 @@ def test_candidate_blocked_cuda_update_col_end_is_on_trailing_kernel_signature()
         assert "TORCH_CHECK(indices.scalar_type() == torch::kInt64" in cpp_source
         assert f"geqrf{n}_blocked_indexed_cuda(data, h, tau, indices, factor_cols, project_tail);" in cpp_source
         assert f"geqrf{n}_blocked_auto_cuda(data, h, tau);" in cpp_source
+        assert (
+            f"geqrf{n}_blocked_make_policy_workspace_cuda(data, factor_cols, project_tail, has_structured);"
+            in cpp_source
+        )
         assert f"geqrf{n}_blocked_make_policy_cuda(data, factor_cols, project_tail);" in cpp_source
         assert (
             f"geqrf{n}_blocked_make_policy_metadata_cuda(data, factor_cols, project_tail, metadata);"
@@ -5038,6 +5508,7 @@ def test_candidate_blocked_cuda_update_col_end_is_on_trailing_kernel_signature()
         assert f"blocked{n}_dense_tail_allowed(" in source
         assert f"blocked{n}_dense_tail_policy_kernel" in source
         assert f"void geqrf{n}_blocked_auto_cuda(" in source
+        assert f"void geqrf{n}_blocked_make_policy_workspace_cuda(" in source
         assert f"void geqrf{n}_blocked_make_policy_cuda(" in source
         assert f"void geqrf{n}_blocked_make_policy_metadata_cuda(" in source
         assert f"void geqrf{n}_blocked_policy_cuda(" in source
@@ -5466,6 +5937,37 @@ def test_candidate_blocked_cuda_build_key_tracks_abi_version(monkeypatch):
     assert candidate._generic_blocked_cuda_extension_build_key(2048) != original[2]
 
 
+def test_candidate_blocked_cuda_source_and_build_key_cache_tracks_config(monkeypatch):
+    candidate = _load_candidate_module()
+    monkeypatch.delenv("FAST_QR_QR512_BLOCKED_TILE_N", raising=False)
+    monkeypatch.delenv("FAST_QR_QR512_TILE_N", raising=False)
+
+    source = candidate._qr512_blocked_cuda_source()
+    build_key = candidate._qr512_blocked_cuda_extension_build_key()
+    assert candidate._qr512_blocked_cuda_source() is source
+    assert candidate._qr512_blocked_cuda_extension_build_key() == build_key
+
+    candidate._qr1024_blocked_cuda_source()
+    candidate._generic_blocked_cuda_source(2048)
+    assert len(candidate._BLOCKED_CUDA_SOURCE_CACHE) == 3
+    assert len(candidate._BLOCKED_CUDA_BUILD_KEY_CACHE) == 1
+
+    monkeypatch.setenv("FAST_QR_QR512_TILE_N", "32")
+    changed_source = candidate._qr512_blocked_cuda_source()
+    changed_key = candidate._qr512_blocked_cuda_extension_build_key()
+
+    assert changed_source is candidate._qr512_blocked_cuda_source()
+    assert changed_source != source
+    assert "constexpr int TILE_N = 32;" in changed_source
+    assert changed_key != build_key
+    assert len(candidate._BLOCKED_CUDA_SOURCE_CACHE) == 4
+    assert len(candidate._BLOCKED_CUDA_BUILD_KEY_CACHE) == 2
+
+    monkeypatch.delenv("FAST_QR_QR512_TILE_N")
+    assert candidate._qr512_blocked_cuda_source() is source
+    assert candidate._qr512_blocked_cuda_extension_build_key() == build_key
+
+
 def test_candidate_blocked_auto_policy_source_uses_dense_tail_env(monkeypatch):
     candidate = _load_candidate_module()
 
@@ -5713,6 +6215,7 @@ def test_candidate_generic_blocked_auto_try_prefers_sync_free_workspace_entrypoi
             tau_arg,
             factor_cols_arg,
             project_tail_arg,
+            has_structured_arg,
         ):
             calls.append(
                 (
@@ -5725,6 +6228,8 @@ def test_candidate_generic_blocked_auto_try_prefers_sync_free_workspace_entrypoi
                     factor_cols_arg.dtype,
                     project_tail_arg.shape,
                     project_tail_arg.dtype,
+                    has_structured_arg.shape,
+                    has_structured_arg.dtype,
                 )
             )
             h_arg[:, :, :] = 19.0
@@ -5749,6 +6254,8 @@ def test_candidate_generic_blocked_auto_try_prefers_sync_free_workspace_entrypoi
             (2,),
             torch.int32,
             (2,),
+            torch.int32,
+            (1,),
             torch.int32,
         )
     ]
@@ -6017,7 +6524,7 @@ def test_candidate_blocked_auto_try_can_use_sync_free_auto_entrypoint(
 
     extension = FakeExtension()
 
-    def fake_workspace(data_arg, h_arg, tau_arg, factor_cols_arg, project_tail_arg):
+    def fake_workspace(data_arg, h_arg, tau_arg, factor_cols_arg, project_tail_arg, has_structured_arg):
         calls.append(
             (
                 "workspace",
@@ -6029,6 +6536,8 @@ def test_candidate_blocked_auto_try_can_use_sync_free_auto_entrypoint(
                 factor_cols_arg.dtype,
                 project_tail_arg.shape,
                 project_tail_arg.dtype,
+                has_structured_arg.shape,
+                has_structured_arg.dtype,
             )
         )
         h_arg[:, :, :] = 7.0
@@ -6059,6 +6568,8 @@ def test_candidate_blocked_auto_try_can_use_sync_free_auto_entrypoint(
             (2,),
             torch.int32,
             (2,),
+            torch.int32,
+            (1,),
             torch.int32,
         )
     ]
@@ -7088,6 +7599,62 @@ def test_candidate_qr1024_cuda_extra_flags_are_configurable(monkeypatch):
     assert candidate._qr1024_cuda_extension_name().startswith("fast_qr1024_cuda_ext_v2_")
 
 
+def test_candidate_one_cta_cuda_source_and_build_key_cache_tracks_config(monkeypatch):
+    candidate = _load_candidate_module()
+    for env_name in (
+        "FAST_QR_QR32_WARPS_PER_CTA",
+        "FAST_QR_QR32_THREADS_PER_CTA",
+        "FAST_QR_QR32_EXTRA_CUDA_CFLAGS",
+        "FAST_QR_QR176_UPDATE_COL_TILE",
+        "FAST_QR_QR176_EXTRA_CUDA_CFLAGS",
+        "FAST_QR_QR352_PANEL_B",
+        "FAST_QR_QR352_EXTRA_CUDA_CFLAGS",
+        "FAST_QR_QR512_UPDATE_COL_TILE",
+        "FAST_QR_QR512_EXTRA_CUDA_CFLAGS",
+        "FAST_QR_QR1024_UPDATE_COL_TILE",
+        "FAST_QR_QR1024_EXTRA_CUDA_CFLAGS",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    sources = (
+        candidate._qr32_cuda_source(),
+        candidate._qr176_cuda_source(),
+        candidate._qr352_cuda_source(),
+        candidate._qr512_cuda_source(),
+        candidate._qr1024_cuda_source(),
+    )
+    keys = (
+        candidate._qr32_cuda_extension_build_key(),
+        candidate._qr176_cuda_extension_build_key(),
+        candidate._qr352_cuda_extension_build_key(),
+        candidate._qr512_cuda_extension_build_key(),
+        candidate._qr1024_cuda_extension_build_key(),
+    )
+    assert len(candidate._ONE_CTA_CUDA_SOURCE_CACHE) == 5
+    assert len(candidate._ONE_CTA_CUDA_BUILD_KEY_CACHE) == 5
+    assert candidate._qr32_cuda_source() is sources[0]
+    assert candidate._qr176_cuda_source() is sources[1]
+    assert candidate._qr352_cuda_source() is sources[2]
+    assert candidate._qr512_cuda_source() is sources[3]
+    assert candidate._qr1024_cuda_source() is sources[4]
+    assert candidate._qr512_cuda_extension_build_key() == keys[3]
+
+    monkeypatch.setenv("FAST_QR_QR176_UPDATE_COL_TILE", "16")
+    changed_source = candidate._qr176_cuda_source()
+    changed_key = candidate._qr176_cuda_extension_build_key()
+
+    assert changed_source is candidate._qr176_cuda_source()
+    assert changed_source != sources[1]
+    assert "constexpr int UPDATE_COL_TILE = 16;" in changed_source
+    assert changed_key != keys[1]
+    assert len(candidate._ONE_CTA_CUDA_SOURCE_CACHE) == 6
+    assert len(candidate._ONE_CTA_CUDA_BUILD_KEY_CACHE) == 6
+
+    monkeypatch.delenv("FAST_QR_QR176_UPDATE_COL_TILE")
+    assert candidate._qr176_cuda_source() is sources[1]
+    assert candidate._qr176_cuda_extension_build_key() == keys[1]
+
+
 def test_candidate_qr32_strict_mode_raises_on_missing_cuda(monkeypatch):
     candidate = _load_candidate_module()
     monkeypatch.setenv("FAST_QR_REQUIRE_QR32_CUDA", "1")
@@ -7419,22 +7986,59 @@ def test_candidate_output_workspace_cache_is_per_input(monkeypatch):
     assert torch.equal(tau_a_zeroed, torch.zeros_like(tau_a_zeroed))
     assert tau_b.data_ptr() != tau_a.data_ptr()
 
-    policy_a, project_a = candidate.allocate_blocked_policy_workspace(data_a, 16)
+    policy_a, project_a, structured_a = candidate.allocate_blocked_policy_workspace(data_a, 16)
     policy_a.fill_(5)
     project_a.fill_(1)
-    policy_a_again, project_a_again = candidate.allocate_blocked_policy_workspace(data_a, 16)
-    policy_b, project_b = candidate.allocate_blocked_policy_workspace(data_b, 16)
+    structured_a.fill_(0)
+    policy_a_again, project_a_again, structured_a_again = candidate.allocate_blocked_policy_workspace(data_a, 16)
+    policy_b, project_b, structured_b = candidate.allocate_blocked_policy_workspace(data_b, 16)
 
     assert policy_a_again.data_ptr() == policy_a.data_ptr()
     assert project_a_again.data_ptr() == project_a.data_ptr()
+    assert structured_a_again.data_ptr() == structured_a.data_ptr()
     assert policy_b.data_ptr() != policy_a.data_ptr()
     assert project_b.data_ptr() != project_a.data_ptr()
+    assert structured_b.data_ptr() != structured_a.data_ptr()
     assert policy_a_again.dtype == torch.int32
     assert project_a_again.dtype == torch.int32
+    assert structured_a_again.dtype == torch.int32
 
     monkeypatch.setenv("FAST_QR_OUTPUT_WORKSPACE_CACHE", "0")
     h_fresh = candidate.allocate_column_major_H(3, 16, data_a)
     assert h_fresh.data_ptr() != h_a.data_ptr()
+
+
+def test_candidate_grouped_workspace_allocators_share_cache_decision(monkeypatch):
+    candidate = _load_candidate_module()
+    candidate._OUTPUT_WORKSPACE_CACHE.clear()
+    calls = {"count": 0}
+
+    def cache_enabled(_data):
+        calls["count"] += 1
+        return True
+
+    monkeypatch.setattr(candidate, "_output_workspace_cache_enabled", cache_enabled)
+    data = torch.empty((3, 16, 16), dtype=torch.float32)
+
+    h, tau = candidate.allocate_h_tau(3, 16, data)
+    assert calls["count"] == 1
+    h_again, tau_again = candidate.allocate_h_tau(3, 16, data)
+    assert calls["count"] == 2
+    assert h_again.data_ptr() == h.data_ptr()
+    assert tau_again.data_ptr() == tau.data_ptr()
+
+    factor_cols, project_tail, has_structured = candidate.allocate_blocked_policy_workspace(data, 16)
+    assert calls["count"] == 3
+    factor_again, project_again, structured_again = candidate.allocate_blocked_policy_workspace(data, 16)
+    assert calls["count"] == 4
+    assert factor_again.data_ptr() == factor_cols.data_ptr()
+    assert project_again.data_ptr() == project_tail.data_ptr()
+    assert structured_again.data_ptr() == has_structured.data_ptr()
+
+    candidate.allocate_column_major_H(3, 16, data, cache_enabled=True)
+    candidate.allocate_tau(3, 16, data, cache_enabled=True)
+    candidate.allocate_blocked_policy_workspace(data, 16, cache_enabled=True)
+    assert calls["count"] == 4
 
 
 def test_candidate_sampled_classifier_basic_profiles():
@@ -7568,7 +8172,7 @@ def test_candidate_embedded_rectangular_geqrf_passes_clustered_case():
 def test_candidate_structured_embeddings_overwrite_prefilled_h(monkeypatch):
     candidate = _load_candidate_module()
 
-    def nan_column_major_h(batch, n, data):
+    def nan_column_major_h(batch, n, data, **_kwargs):
         h = torch.empty_strided(
             (batch, n, n),
             stride=(n * n, 1, n),
@@ -7804,7 +8408,7 @@ def test_large_unique_shape_fast_path_skips_default_dense_tail_guard_before_bloc
         (4096, "qr4096_fast", "_qr4096_blocked_cuda_route_enabled", "_qr4096_blocked_cuda_auto_fast"),
     ],
 )
-def test_large_unique_shape_explicit_dense_tail_policy_still_preempts_blocked_auto(
+def test_large_unique_shape_explicit_dense_tail_policy_still_uses_blocked_auto(
     monkeypatch,
     n,
     fast_name,
@@ -7813,15 +8417,24 @@ def test_large_unique_shape_explicit_dense_tail_policy_still_preempts_blocked_au
 ):
     candidate = _load_candidate_module()
     fake_data = SimpleNamespace(shape=(8 if n == 2048 else 2, n, n))
+    sentinel = object()
 
     monkeypatch.setenv(f"FAST_QR_DENSE_TAIL_FORCE_{n}", "1")
     monkeypatch.setattr(candidate, blocked_route_name, lambda _data: True)
     monkeypatch.setattr(candidate, "_blocked_auto_policy_enabled", lambda _data, size: size == n)
-    monkeypatch.setattr(candidate, auto_name, lambda _data: (_ for _ in ()).throw(AssertionError("auto bypassed explicit tail policy")))
-    monkeypatch.setattr(candidate, "_dense_tail_route_or_fallback", lambda _data, route: route)
-    monkeypatch.setattr(candidate, "_dense_tail_projection_assumed", lambda _data: f"qr{n}_tail")
+    monkeypatch.setattr(candidate, auto_name, lambda _data: sentinel)
+    monkeypatch.setattr(
+        candidate,
+        "_dense_tail_route_or_fallback",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("blocked auto should consume explicit tail policy")),
+    )
+    monkeypatch.setattr(
+        candidate,
+        "_dense_tail_projection_assumed",
+        lambda _data: (_ for _ in ()).throw(AssertionError("blocked auto should consume explicit tail policy")),
+    )
 
-    assert getattr(candidate, fast_name)(fake_data) == f"qr{n}_tail"
+    assert getattr(candidate, fast_name)(fake_data) is sentinel
 
 
 @pytest.mark.parametrize(
@@ -7857,11 +8470,11 @@ def test_large_route_plan_skips_default_dense_tail_guard_before_blocked_auto(
 @pytest.mark.parametrize(
     ("n", "blocked_route_name", "expected_route"),
     [
-        (2048, "_qr2048_blocked_cuda_route_enabled", "qr2048_dense_fast"),
-        (4096, "_qr4096_blocked_cuda_route_enabled", "qr4096_dense_fast"),
+        (2048, "_qr2048_blocked_cuda_route_enabled", "qr2048_blocked_cuda_auto_fast"),
+        (4096, "_qr4096_blocked_cuda_route_enabled", "qr4096_blocked_cuda_auto_fast"),
     ],
 )
-def test_large_route_plan_explicit_dense_tail_policy_preempts_blocked_auto(
+def test_large_route_plan_explicit_dense_tail_policy_still_uses_blocked_auto(
     monkeypatch,
     n,
     blocked_route_name,
@@ -7874,7 +8487,11 @@ def test_large_route_plan_explicit_dense_tail_policy_preempts_blocked_auto(
     monkeypatch.setenv(f"FAST_QR_DENSE_TAIL_FORCE_{n}", "1")
     monkeypatch.setattr(candidate, blocked_route_name, lambda _data: True)
     monkeypatch.setattr(candidate, "_blocked_auto_policy_enabled", lambda _data, size: size == n)
-    monkeypatch.setattr(candidate, "_dense_tail_route_or_fallback", lambda _data, route: route)
+    monkeypatch.setattr(
+        candidate,
+        "_dense_tail_route_or_fallback",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("blocked auto should consume explicit tail policy")),
+    )
 
     route, plan = candidate._compute_route_plan(fake_data)
 
@@ -8350,6 +8967,10 @@ def test_candidate_policy_reports_public_benchmark_routes():
     assert rows[3]["column_major_h"] == "conditional"
     assert rows[3]["h_layout"] == "column_major_when_fast_path_applies_else_torch.geqrf_default"
     assert rows[3]["shape_collision_cases"] == ["dense", "mixed", "rankdef", "clustered"]
+    assert rows[3]["primary"] == "blocked_cuda_auto_or_fallback"
+    assert rows[3]["case_specific_primary"] == "dense_tail_projection_or_fallback"
+    assert rows[3]["active_cols"] == "auto_policy"
+    assert rows[3]["case_specific_active_cols"] == 480
     assert rows[3]["dense_tail"] == {"cut": 32, "rank": 480, "threshold": 3.0e-2, "force": False}
     assert rows[3]["required_cuda_kernel"] == "qr512_blocked_householder_r_maintenance"
     assert rows[3]["required_repair_modes"] == ["panel_refresh_mode=prefix", "r_maintenance_mode=panel-prefix"]
@@ -8371,6 +8992,10 @@ def test_candidate_policy_reports_public_benchmark_routes():
     assert rows[4]["classifier_needed_for_current_candidate"] is False
     assert rows[4]["classifier_on_current_hot_path"] is False
     assert rows[4]["dispatch_info_sources"] == ["data.shape"]
+    assert rows[4]["primary"] == "blocked_cuda_auto_or_fallback"
+    assert rows[4]["case_specific_primary"] == "dense_tail_projection_or_fallback"
+    assert rows[4]["active_cols"] == "auto_policy"
+    assert rows[4]["case_specific_active_cols"] == 960
     assert rows[4]["required_cuda_kernel"] == "qr1024_blocked_householder_r_maintenance"
     assert rows[4]["required_repair_modes"] == ["panel_refresh_mode=prefix", "r_maintenance_mode=panel-prefix"]
     assert rows[4]["candidate_config_shape_label"] == "qr1024"
@@ -8378,23 +9003,29 @@ def test_candidate_policy_reports_public_benchmark_routes():
     assert rows[4]["candidate_config_benchmark_indices"] == "4,8,11"
     assert rows[4]["candidate_config_correctness_indices"] == "4,12,13,14,15,20"
     assert "one-CTA QR1024" in rows[4]["required_cuda_reason"]
-    assert rows[7]["primary"] == "per_matrix_mixed_structured_fast"
+    assert rows[7]["primary"] == "blocked_cuda_auto_or_fallback"
+    assert rows[7]["case_specific_primary"] == "per_matrix_mixed_structured_fast"
     assert rows[7]["required_cuda_kernel"] == "qr512_blocked_householder_r_maintenance"
-    assert rows[7]["column_major_h"] is True
-    assert rows[7]["h_layout"] == "column_major"
+    assert rows[7]["column_major_h"] == "conditional"
+    assert rows[7]["h_layout"] == "column_major_when_fast_path_applies_else_torch.geqrf_default"
     assert rows[7]["mixed_dense_tail"]["cut"] == 0
     assert "scaled_nearrank_cols=384" in rows[7]["per_matrix_groups"]
     assert "fallback=torch.geqrf" in rows[7]["per_matrix_groups"]
-    assert rows[8]["primary"] == "per_matrix_mixed_structured_fast"
+    assert rows[8]["primary"] == "blocked_cuda_auto_or_fallback"
+    assert rows[8]["case_specific_primary"] == "per_matrix_mixed_structured_fast"
     assert rows[8]["shape_collision_cases"] == ["dense", "mixed", "nearrank"]
     assert rows[8]["mixed_dense_tail"] == {"cut": 8, "rank": 1016, "threshold": 2.0e-2}
     assert "tiny_dense_tail_cut=8" in rows[8]["per_matrix_groups"]
     assert rows[5]["case_info_source"] == "data.shape"
     assert rows[5]["shape_only_case_selection"] is True
     assert rows[5]["uses_tensor_values_for_case_selection"] is False
-    assert rows[5]["uses_tensor_values_for_dispatch"] is True
-    assert rows[5]["dispatch_info_sources"] == ["data.shape", "tensor_values"]
+    assert rows[5]["uses_tensor_values_for_dispatch"] is False
+    assert rows[5]["dispatch_info_sources"] == ["data.shape"]
     assert rows[5]["classifier_needed_for_current_candidate"] is False
+    assert rows[5]["primary"] == "blocked_cuda_auto_or_fallback"
+    assert rows[5]["case_specific_primary"] == "dense_tail_projection_or_fallback"
+    assert rows[5]["active_cols"] == "auto_policy"
+    assert rows[5]["case_specific_active_cols"] == 1984
     assert rows[5]["blocked_cuda_route"] == "qr2048_blocked_cuda_auto_fast"
     assert rows[5]["blocked_cuda_base_route"] == "qr2048_blocked_cuda_fast"
     assert rows[5]["required_cuda_kernel"] == "qr2048_multi_cta_blocked_householder"
@@ -8406,15 +9037,23 @@ def test_candidate_policy_reports_public_benchmark_routes():
     assert rows[6]["required_cuda_kernel"] == "qr4096_multi_cta_blocked_householder"
     assert rows[6]["blocked_cuda_route"] == "qr4096_blocked_cuda_auto_fast"
     assert rows[6]["blocked_cuda_base_route"] == "qr4096_blocked_cuda_fast"
+    assert rows[6]["primary"] == "blocked_cuda_auto_or_fallback"
+    assert rows[6]["case_specific_primary"] == "dense_tail_projection_or_fallback"
+    assert rows[6]["active_cols"] == "auto_policy"
+    assert rows[6]["case_specific_active_cols"] == 3968
     assert rows[6]["candidate_config_shape_label"] == "qr4096"
     assert rows[6]["candidate_config_env_prefix"] == "FAST_QR_QR4096"
     assert rows[6]["candidate_config_benchmark_indices"] == "6"
     assert rows[6]["candidate_config_correctness_indices"] == "5,18"
-    assert rows[9]["active_cols"] == 384
-    assert rows[10]["active_cols"] == 258
-    assert rows[11]["primary"] == "nearrank_tail_projection"
+    assert rows[9]["active_cols"] == "auto_policy"
+    assert rows[9]["case_specific_active_cols"] == 384
+    assert rows[10]["active_cols"] == "auto_policy"
+    assert rows[10]["case_specific_active_cols"] == 258
+    assert rows[11]["primary"] == "blocked_cuda_auto_or_fallback"
+    assert rows[11]["case_specific_primary"] == "nearrank_tail_projection"
     assert rows[11]["required_cuda_kernel"] == "qr1024_blocked_householder_r_maintenance"
-    assert rows[11]["active_cols"] == 768
+    assert rows[11]["active_cols"] == "auto_policy"
+    assert rows[11]["case_specific_active_cols"] == 768
 
 
 def test_candidate_policy_marks_classifier_hot_path_when_structured_first(monkeypatch):
@@ -8683,6 +9322,11 @@ def test_mixed_seed_sweep_on_small_case():
     assert summary["num_rows"] == 2
     assert summary["num_public_seed_rows"] == 1
     assert summary["num_popcorn_seed_rows"] == 1
+
+
+def test_mixed_seed_sweep_accepts_blocked_auto_routes():
+    assert "qr512_blocked_cuda_auto_fast" in allowed_mixed_routes({"n": 512})
+    assert "qr1024_blocked_cuda_auto_fast" in allowed_mixed_routes({"n": 1024})
 
 
 def test_tail_policy_sweep_candidate_cut_on_small_case():

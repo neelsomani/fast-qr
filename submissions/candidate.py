@@ -60,6 +60,10 @@ _ROUTE_CACHE = {}
 _SAMPLE_INDEX_CACHE = {}
 _OUTPUT_WORKSPACE_CACHE = {}
 _BLOCKED_AUTO_POLICY_CACHE = {}
+_ONE_CTA_CUDA_SOURCE_CACHE = {}
+_ONE_CTA_CUDA_BUILD_KEY_CACHE = {}
+_BLOCKED_CUDA_SOURCE_CACHE = {}
+_BLOCKED_CUDA_BUILD_KEY_CACHE = {}
 _BLOCKED_CUDA_ABI_VERSION = "blocked-cta-schedule-v9-tail-threshold"
 
 _TAIL_POLICY_ENV_KEYS = (
@@ -1300,6 +1304,13 @@ void geqrf512_blocked_make_policy_cuda(
     torch::Tensor project_tail
 );
 
+void geqrf512_blocked_make_policy_workspace_cuda(
+    torch::Tensor data,
+    torch::Tensor factor_cols,
+    torch::Tensor project_tail,
+    torch::Tensor has_structured
+);
+
 void geqrf512_blocked_make_policy_metadata_cuda(
     torch::Tensor data,
     torch::Tensor factor_cols,
@@ -1391,18 +1402,21 @@ void geqrf512_blocked_auto_workspace(
     torch::Tensor h,
     torch::Tensor tau,
     torch::Tensor factor_cols,
-    torch::Tensor project_tail
+    torch::Tensor project_tail,
+    torch::Tensor has_structured
 ) {
     TORCH_CHECK(data.is_cuda(), "data must be CUDA");
     TORCH_CHECK(h.is_cuda(), "H must be CUDA");
     TORCH_CHECK(tau.is_cuda(), "tau must be CUDA");
     TORCH_CHECK(factor_cols.is_cuda(), "factor_cols must be CUDA");
     TORCH_CHECK(project_tail.is_cuda(), "project_tail must be CUDA");
+    TORCH_CHECK(has_structured.is_cuda(), "has_structured must be CUDA");
     TORCH_CHECK(data.scalar_type() == torch::kFloat32, "data must be float32");
     TORCH_CHECK(h.scalar_type() == torch::kFloat32, "H must be float32");
     TORCH_CHECK(tau.scalar_type() == torch::kFloat32, "tau must be float32");
     TORCH_CHECK(factor_cols.scalar_type() == torch::kInt32, "factor_cols must be int32");
     TORCH_CHECK(project_tail.scalar_type() == torch::kInt32, "project_tail must be int32");
+    TORCH_CHECK(has_structured.scalar_type() == torch::kInt32, "has_structured must be int32");
     TORCH_CHECK(data.dim() == 3, "data must have shape (batch, 512, 512)");
     TORCH_CHECK(data.size(1) == 512 && data.size(2) == 512, "data must have shape (batch, 512, 512)");
     TORCH_CHECK(h.sizes() == data.sizes(), "H shape must match data");
@@ -1412,7 +1426,9 @@ void geqrf512_blocked_auto_workspace(
                 "factor_cols must have shape (batch,)");
     TORCH_CHECK(project_tail.dim() == 1 && project_tail.size(0) == data.size(0),
                 "project_tail must have shape (batch,)");
-    geqrf512_blocked_make_policy_cuda(data, factor_cols, project_tail);
+    TORCH_CHECK(has_structured.dim() == 1 && has_structured.size(0) >= 1,
+                "has_structured must have shape (at least 1,)");
+    geqrf512_blocked_make_policy_workspace_cuda(data, factor_cols, project_tail, has_structured);
     geqrf512_blocked_policy_cuda(data, h, tau, factor_cols, project_tail, 512, true, (3 * 512) / 4);
 }
 
@@ -2952,14 +2968,13 @@ void geqrf512_blocked_indexed_cuda(
     );
 }
 
-void geqrf512_blocked_make_policy_cuda(
+void geqrf512_blocked_make_policy_workspace_cuda(
     torch::Tensor data,
     torch::Tensor factor_cols,
-    torch::Tensor project_tail
+    torch::Tensor project_tail,
+    torch::Tensor has_structured
 ) {
     const int64_t batch = data.size(0);
-    auto int_options = data.options().dtype(torch::kInt32);
-    auto has_structured = torch::empty({1}, int_options);
     const int threads = BLOCK_THREADS;
     const int warp_count = (threads + 31) >> 5;
     const size_t policy_shmem = size_t(8 * warp_count) * sizeof(float);
@@ -2998,6 +3013,16 @@ void geqrf512_blocked_make_policy_cuda(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
+}
+
+void geqrf512_blocked_make_policy_cuda(
+    torch::Tensor data,
+    torch::Tensor factor_cols,
+    torch::Tensor project_tail
+) {
+    auto int_options = data.options().dtype(torch::kInt32);
+    auto has_structured = torch::empty({1}, int_options);
+    geqrf512_blocked_make_policy_workspace_cuda(data, factor_cols, project_tail, has_structured);
 }
 
 void geqrf512_blocked_make_policy_metadata_cuda(
@@ -3502,6 +3527,33 @@ def _specialize_one_cta_cuda_source(
     return specialized
 
 
+def _one_cta_cuda_source_cached(config: tuple, source_factory) -> str:
+    cached = _ONE_CTA_CUDA_SOURCE_CACHE.get(config)
+    if cached is not None:
+        return cached
+    source = source_factory()
+    _ONE_CTA_CUDA_SOURCE_CACHE[config] = source
+    return source
+
+
+def _one_cta_cuda_build_key_cached(config: tuple, cpp_source: str, cuda_source: str, flags: list[str]) -> str:
+    cache_key = (config, tuple(flags))
+    cached = _ONE_CTA_CUDA_BUILD_KEY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    payload = "\0".join(
+        [
+            cpp_source,
+            cuda_source,
+            *(str(value) for value in config),
+            *flags,
+        ]
+    )
+    build_key = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    _ONE_CTA_CUDA_BUILD_KEY_CACHE[cache_key] = build_key
+    return build_key
+
+
 def _qr512_cuda_threads_per_cta() -> int:
     return _threads_per_cta_for("FAST_QR_QR512", 256)
 
@@ -3533,16 +3585,34 @@ def _qr512_cuda_update_col_tile() -> int:
     return 4
 
 
-def _qr512_cuda_source() -> str:
-    return _specialize_one_cta_cuda_source(
-        _QR512_CUDA_SOURCE,
+def _qr512_cuda_config() -> tuple:
+    return (
+        "qr512",
         _qr512_cuda_threads_per_cta(),
         _qr512_cuda_panel_b(),
         _qr512_cuda_update_mode(),
         _qr512_cuda_precision_mode(),
         _qr512_cuda_panel_refresh_mode(),
         _qr512_cuda_r_maintenance_mode(),
-        update_col_tile=_qr512_cuda_update_col_tile(),
+        _qr512_cuda_update_col_tile(),
+    )
+
+
+def _qr512_cuda_source() -> str:
+    config = _qr512_cuda_config()
+    _, threads, panel_b, update_mode, precision_mode, panel_refresh_mode, r_maintenance_mode, update_col_tile = config
+    return _one_cta_cuda_source_cached(
+        config,
+        lambda: _specialize_one_cta_cuda_source(
+            _QR512_CUDA_SOURCE,
+            threads,
+            panel_b,
+            update_mode,
+            precision_mode,
+            panel_refresh_mode,
+            r_maintenance_mode,
+            update_col_tile=update_col_tile,
+        ),
     )
 
 
@@ -3577,16 +3647,34 @@ def _qr1024_cuda_update_col_tile() -> int:
     return 4
 
 
-def _qr1024_cuda_source() -> str:
-    return _specialize_one_cta_cuda_source(
-        _QR1024_CUDA_SOURCE,
+def _qr1024_cuda_config() -> tuple:
+    return (
+        "qr1024",
         _qr1024_cuda_threads_per_cta(),
         _qr1024_cuda_panel_b(),
         _qr1024_cuda_update_mode(),
         _qr1024_cuda_precision_mode(),
         _qr1024_cuda_panel_refresh_mode(),
         _qr1024_cuda_r_maintenance_mode(),
-        update_col_tile=_qr1024_cuda_update_col_tile(),
+        _qr1024_cuda_update_col_tile(),
+    )
+
+
+def _qr1024_cuda_source() -> str:
+    config = _qr1024_cuda_config()
+    _, threads, panel_b, update_mode, precision_mode, panel_refresh_mode, r_maintenance_mode, update_col_tile = config
+    return _one_cta_cuda_source_cached(
+        config,
+        lambda: _specialize_one_cta_cuda_source(
+            _QR1024_CUDA_SOURCE,
+            threads,
+            panel_b,
+            update_mode,
+            precision_mode,
+            panel_refresh_mode,
+            r_maintenance_mode,
+            update_col_tile=update_col_tile,
+        ),
     )
 
 
@@ -3626,8 +3714,11 @@ def _workspace_tensor(
     *,
     dtype: torch.dtype = torch.float32,
     zero: bool = False,
+    cache_enabled: bool | None = None,
 ) -> torch.Tensor | None:
-    if not _output_workspace_cache_enabled(data):
+    if cache_enabled is None:
+        cache_enabled = _output_workspace_cache_enabled(data)
+    if not cache_enabled:
         return None
 
     key = _workspace_cache_key(data, kind, shape, stride, dtype)
@@ -3657,10 +3748,16 @@ def _workspace_tensor(
     return tensor
 
 
-def allocate_column_major_H(batch: int, n: int, data: torch.Tensor) -> torch.Tensor:
+def allocate_column_major_H(
+    batch: int,
+    n: int,
+    data: torch.Tensor,
+    *,
+    cache_enabled: bool | None = None,
+) -> torch.Tensor:
     shape = (batch, n, n)
     stride = (n * n, 1, n)
-    cached = _workspace_tensor(data, "h_colmajor", shape, stride)
+    cached = _workspace_tensor(data, "h_colmajor", shape, stride, cache_enabled=cache_enabled)
     if cached is not None:
         return cached
     return torch.empty_strided(
@@ -3682,10 +3779,17 @@ def write_tau_zeros(batch: int, n: int, data: torch.Tensor) -> torch.Tensor:
     return allocate_tau(batch, n, data, zero=True)
 
 
-def allocate_tau(batch: int, n: int, data: torch.Tensor, *, zero: bool = False) -> torch.Tensor:
+def allocate_tau(
+    batch: int,
+    n: int,
+    data: torch.Tensor,
+    *,
+    zero: bool = False,
+    cache_enabled: bool | None = None,
+) -> torch.Tensor:
     shape = (batch, n)
     stride = (n, 1)
-    cached = _workspace_tensor(data, "tau", shape, stride, zero=zero)
+    cached = _workspace_tensor(data, "tau", shape, stride, zero=zero, cache_enabled=cache_enabled)
     if cached is not None:
         return cached
     if zero:
@@ -3693,16 +3797,32 @@ def allocate_tau(batch: int, n: int, data: torch.Tensor, *, zero: bool = False) 
     return torch.empty(shape, device=data.device, dtype=torch.float32)
 
 
-def allocate_blocked_policy_workspace(data: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+def allocate_h_tau(batch: int, n: int, data: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    cache_enabled = _output_workspace_cache_enabled(data)
+    return (
+        allocate_column_major_H(batch, n, data, cache_enabled=cache_enabled),
+        allocate_tau(batch, n, data, cache_enabled=cache_enabled),
+    )
+
+
+def allocate_blocked_policy_workspace(
+    data: torch.Tensor,
+    n: int,
+    *,
+    cache_enabled: bool | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch = int(data.shape[0])
     shape = (batch,)
     stride = (1,)
+    if cache_enabled is None:
+        cache_enabled = _output_workspace_cache_enabled(data)
     factor_cols = _workspace_tensor(
         data,
         f"blocked_policy_factor_cols_{n}",
         shape,
         stride,
         dtype=torch.int32,
+        cache_enabled=cache_enabled,
     )
     project_tail = _workspace_tensor(
         data,
@@ -3710,12 +3830,23 @@ def allocate_blocked_policy_workspace(data: torch.Tensor, n: int) -> tuple[torch
         shape,
         stride,
         dtype=torch.int32,
+        cache_enabled=cache_enabled,
+    )
+    has_structured = _workspace_tensor(
+        data,
+        f"blocked_policy_has_structured_{n}",
+        (1,),
+        (1,),
+        dtype=torch.int32,
+        cache_enabled=cache_enabled,
     )
     if factor_cols is None:
         factor_cols = torch.empty(shape, device=data.device, dtype=torch.int32)
     if project_tail is None:
         project_tail = torch.empty(shape, device=data.device, dtype=torch.int32)
-    return factor_cols, project_tail
+    if has_structured is None:
+        has_structured = torch.empty((1,), device=data.device, dtype=torch.int32)
+    return factor_cols, project_tail, has_structured
 
 
 def zero_tau_tail(tau: torch.Tensor, start: int) -> torch.Tensor:
@@ -3977,7 +4108,11 @@ def _structured_routes_enabled() -> bool:
     )
 
 
-def _blocked_auto_policy_enabled(data: torch.Tensor, n: int) -> bool:
+def _blocked_auto_policy_enabled_with_default(
+    data: torch.Tensor,
+    n: int,
+    default_blocked_enabled: bool | None = None,
+) -> bool:
     if os.environ.get(f"FAST_QR_DISABLE_QR{n}_BLOCKED_AUTO_POLICY") == "1":
         return False
     if os.environ.get("FAST_QR_DISABLE_BLOCKED_AUTO_POLICY") == "1":
@@ -3992,7 +4127,33 @@ def _blocked_auto_policy_enabled(data: torch.Tensor, n: int) -> bool:
     if raw_global is not None and raw_global.strip() != "":
         return _env_truthy("FAST_QR_ENABLE_BLOCKED_AUTO_POLICY")
 
-    return n in (512, 1024, 2048, 4096) and _b200_default_blocked_cuda_enabled(data, n)
+    if default_blocked_enabled is None:
+        default_blocked_enabled = _b200_default_blocked_cuda_enabled(data, n)
+    return n in (512, 1024, 2048, 4096) and bool(default_blocked_enabled)
+
+
+def _blocked_auto_policy_enabled(data: torch.Tensor, n: int) -> bool:
+    return _blocked_auto_policy_enabled_with_default(data, n)
+
+
+def _blocked_cuda_auto_route_enabled(data: torch.Tensor, n: int) -> bool:
+    if n not in (512, 1024, 2048, 4096):
+        return False
+    if os.environ.get(f"FAST_QR_DISABLE_QR{n}_BLOCKED_CUDA") == "1":
+        return False
+    if not getattr(data, "is_cuda", False):
+        return False
+    if getattr(data, "dtype", None) != torch.float32:
+        return False
+    if getattr(data, "ndim", None) != 3:
+        return False
+    if tuple(getattr(data, "shape", ())[-2:]) != (n, n):
+        return False
+
+    default_blocked_enabled = _b200_default_blocked_cuda_enabled(data, n)
+    if not default_blocked_enabled and os.environ.get(f"FAST_QR_REQUIRE_QR{n}_BLOCKED_CUDA") != "1":
+        return False
+    return _blocked_auto_policy_enabled_with_default(data, n, default_blocked_enabled)
 
 
 def _blocked_auto_policy_grouping_enabled(data: torch.Tensor, n: int) -> bool:
@@ -4179,28 +4340,33 @@ def _qr32_cuda_threads_per_cta() -> int:
     return 32 * _qr32_cuda_warps_per_cta()
 
 
-def _qr32_cuda_source() -> str:
+def _qr32_cuda_config() -> tuple:
     warps = _qr32_cuda_warps_per_cta()
-    threads = 32 * warps
-    return (
-        _QR32_CUDA_SOURCE.replace(
-            "constexpr int QR32_WARPS_PER_CTA = 1;",
-            f"constexpr int QR32_WARPS_PER_CTA = {warps};",
-        )
-        .replace("__launch_bounds__(32 * QR32_WARPS_PER_CTA)", f"__launch_bounds__({threads})")
+    return ("qr32", warps, 32 * warps)
+
+
+def _qr32_cuda_source() -> str:
+    config = _qr32_cuda_config()
+    _, warps, threads = config
+    return _one_cta_cuda_source_cached(
+        config,
+        lambda: (
+            _QR32_CUDA_SOURCE.replace(
+                "constexpr int QR32_WARPS_PER_CTA = 1;",
+                f"constexpr int QR32_WARPS_PER_CTA = {warps};",
+            ).replace("__launch_bounds__(32 * QR32_WARPS_PER_CTA)", f"__launch_bounds__({threads})")
+        ),
     )
 
 
 def _qr32_cuda_extension_build_key() -> str:
-    payload = "\0".join(
-        [
-            _QR32_CPP_SOURCE,
-            _qr32_cuda_source(),
-            str(_qr32_cuda_warps_per_cta()),
-            *_qr32_cuda_extra_cuda_cflags(),
-        ]
+    config = _qr32_cuda_config()
+    return _one_cta_cuda_build_key_cached(
+        config,
+        _QR32_CPP_SOURCE,
+        _qr32_cuda_source(),
+        _qr32_cuda_extra_cuda_cflags(),
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _qr32_cuda_extension_name() -> str:
@@ -4268,6 +4434,21 @@ def _load_qr32_cuda_extension():
     return _QR32_CUDA_EXTENSION
 
 
+def _qr32_cuda_public_fast(data: torch.Tensor) -> output_t:
+    extension = _load_qr32_cuda_extension()
+    if extension is None:
+        return _geqrf_fallback(data)
+
+    batch, n, _ = data.shape
+    h, tau = allocate_h_tau(batch, n, data)
+    try:
+        extension.geqrf32(data, h, tau)
+    except Exception as exc:
+        _fail_qr32_cuda(f"qr32 CUDA extension execution failed: {type(exc).__name__}: {exc}")
+        return _geqrf_fallback(data)
+    return h, tau
+
+
 def _qr32_cuda_fast(data: torch.Tensor) -> output_t:
     if not data.is_cuda:
         if _qr32_cuda_required():
@@ -4278,19 +4459,7 @@ def _qr32_cuda_fast(data: torch.Tensor) -> output_t:
             _fail_qr32_cuda("qr32 CUDA extension requires float32 input with shape (batch, 32, 32)")
         return _geqrf_fallback(data)
 
-    extension = _load_qr32_cuda_extension()
-    if extension is None:
-        return _geqrf_fallback(data)
-
-    batch, n, _ = data.shape
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
-    try:
-        extension.geqrf32(data, h, tau)
-    except Exception as exc:
-        _fail_qr32_cuda(f"qr32 CUDA extension execution failed: {type(exc).__name__}: {exc}")
-        return _geqrf_fallback(data)
-    return h, tau
+    return _qr32_cuda_public_fast(data)
 
 
 def _qr176_cuda_required() -> bool:
@@ -4313,25 +4482,35 @@ def _qr176_cuda_update_col_tile() -> int:
     return 16 if _b200_default_blocked_repair_enabled() else 8
 
 
-def _qr176_cuda_source() -> str:
-    return _specialize_one_cta_cuda_source(
-        _QR176_CUDA_SOURCE,
+def _qr176_cuda_config() -> tuple:
+    return (
+        "qr176",
         _qr176_cuda_threads_per_cta(),
-        update_col_tile=_qr176_cuda_update_col_tile(),
+        _qr176_cuda_update_col_tile(),
+    )
+
+
+def _qr176_cuda_source() -> str:
+    config = _qr176_cuda_config()
+    _, threads, update_col_tile = config
+    return _one_cta_cuda_source_cached(
+        config,
+        lambda: _specialize_one_cta_cuda_source(
+            _QR176_CUDA_SOURCE,
+            threads,
+            update_col_tile=update_col_tile,
+        ),
     )
 
 
 def _qr176_cuda_extension_build_key() -> str:
-    payload = "\0".join(
-        [
-            _QR176_CPP_SOURCE,
-            _qr176_cuda_source(),
-            str(_qr176_cuda_threads_per_cta()),
-            str(_qr176_cuda_update_col_tile()),
-            *_qr176_cuda_extra_cuda_cflags(),
-        ]
+    config = _qr176_cuda_config()
+    return _one_cta_cuda_build_key_cached(
+        config,
+        _QR176_CPP_SOURCE,
+        _qr176_cuda_source(),
+        _qr176_cuda_extra_cuda_cflags(),
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _qr176_cuda_extension_name() -> str:
@@ -4399,6 +4578,21 @@ def _load_qr176_cuda_extension():
     return _QR176_CUDA_EXTENSION
 
 
+def _qr176_cuda_public_fast(data: torch.Tensor) -> output_t:
+    extension = _load_qr176_cuda_extension()
+    if extension is None:
+        return _geqrf_fallback(data)
+
+    batch, n, _ = data.shape
+    h, tau = allocate_h_tau(batch, n, data)
+    try:
+        extension.geqrf176(data, h, tau)
+    except Exception as exc:
+        _fail_qr176_cuda(f"qr176 CUDA extension execution failed: {type(exc).__name__}: {exc}")
+        return _geqrf_fallback(data)
+    return h, tau
+
+
 def _qr176_cuda_fast(data: torch.Tensor) -> output_t:
     if not data.is_cuda:
         if _qr176_cuda_required():
@@ -4409,19 +4603,7 @@ def _qr176_cuda_fast(data: torch.Tensor) -> output_t:
             _fail_qr176_cuda("qr176 CUDA extension requires float32 input with shape (batch, 176, 176)")
         return _geqrf_fallback(data)
 
-    extension = _load_qr176_cuda_extension()
-    if extension is None:
-        return _geqrf_fallback(data)
-
-    batch, n, _ = data.shape
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
-    try:
-        extension.geqrf176(data, h, tau)
-    except Exception as exc:
-        _fail_qr176_cuda(f"qr176 CUDA extension execution failed: {type(exc).__name__}: {exc}")
-        return _geqrf_fallback(data)
-    return h, tau
+    return _qr176_cuda_public_fast(data)
 
 
 def _qr352_cuda_required() -> bool:
@@ -4466,35 +4648,45 @@ def _qr352_cuda_r_maintenance_mode() -> str:
     return _r_maintenance_mode_for("FAST_QR_QR352")
 
 
-def _qr352_cuda_source() -> str:
-    return _specialize_one_cta_cuda_source(
-        _QR352_CUDA_SOURCE,
+def _qr352_cuda_config() -> tuple:
+    return (
+        "qr352",
         _qr352_cuda_threads_per_cta(),
         _qr352_cuda_panel_b(),
         _qr352_cuda_update_mode(),
         _qr352_cuda_precision_mode(),
         _qr352_cuda_panel_refresh_mode(),
         _qr352_cuda_r_maintenance_mode(),
-        update_col_tile=_qr352_cuda_update_col_tile(),
+        _qr352_cuda_update_col_tile(),
+    )
+
+
+def _qr352_cuda_source() -> str:
+    config = _qr352_cuda_config()
+    _, threads, panel_b, update_mode, precision_mode, panel_refresh_mode, r_maintenance_mode, update_col_tile = config
+    return _one_cta_cuda_source_cached(
+        config,
+        lambda: _specialize_one_cta_cuda_source(
+            _QR352_CUDA_SOURCE,
+            threads,
+            panel_b,
+            update_mode,
+            precision_mode,
+            panel_refresh_mode,
+            r_maintenance_mode,
+            update_col_tile=update_col_tile,
+        ),
     )
 
 
 def _qr352_cuda_extension_build_key() -> str:
-    payload = "\0".join(
-        [
-            _QR352_CPP_SOURCE,
-            _qr352_cuda_source(),
-            str(_qr352_cuda_threads_per_cta()),
-            str(_qr352_cuda_update_col_tile()),
-            str(_qr352_cuda_panel_b()),
-            _qr352_cuda_update_mode(),
-            _qr352_cuda_precision_mode(),
-            _qr352_cuda_panel_refresh_mode(),
-            _qr352_cuda_r_maintenance_mode(),
-            *_qr352_cuda_extra_cuda_cflags(),
-        ]
+    config = _qr352_cuda_config()
+    return _one_cta_cuda_build_key_cached(
+        config,
+        _QR352_CPP_SOURCE,
+        _qr352_cuda_source(),
+        _qr352_cuda_extra_cuda_cflags(),
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _qr352_cuda_extension_name() -> str:
@@ -4562,6 +4754,21 @@ def _load_qr352_cuda_extension():
     return _QR352_CUDA_EXTENSION
 
 
+def _qr352_cuda_public_fast(data: torch.Tensor) -> output_t:
+    extension = _load_qr352_cuda_extension()
+    if extension is None:
+        return _geqrf_fallback(data)
+
+    batch, n, _ = data.shape
+    h, tau = allocate_h_tau(batch, n, data)
+    try:
+        extension.geqrf352(data, h, tau)
+    except Exception as exc:
+        _fail_qr352_cuda(f"qr352 CUDA extension execution failed: {type(exc).__name__}: {exc}")
+        return _geqrf_fallback(data)
+    return h, tau
+
+
 def _qr352_cuda_fast(data: torch.Tensor) -> output_t:
     if not data.is_cuda:
         if _qr352_cuda_required():
@@ -4572,19 +4779,7 @@ def _qr352_cuda_fast(data: torch.Tensor) -> output_t:
             _fail_qr352_cuda("qr352 CUDA extension requires float32 input with shape (batch, 352, 352)")
         return _geqrf_fallback(data)
 
-    extension = _load_qr352_cuda_extension()
-    if extension is None:
-        return _geqrf_fallback(data)
-
-    batch, n, _ = data.shape
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
-    try:
-        extension.geqrf352(data, h, tau)
-    except Exception as exc:
-        _fail_qr352_cuda(f"qr352 CUDA extension execution failed: {type(exc).__name__}: {exc}")
-        return _geqrf_fallback(data)
-    return h, tau
+    return _qr352_cuda_public_fast(data)
 
 
 def _qr512_cuda_required() -> bool:
@@ -4701,81 +4896,179 @@ def _qr512_blocked_cuda_sync_free_auto_policy() -> bool:
     return _blocked_sync_free_auto_policy_enabled_for_aliases(("FAST_QR_QR512_BLOCKED", "FAST_QR_QR512"))
 
 
-def _qr512_blocked_cuda_source() -> str:
+def _blocked_cuda_source_config(n: int) -> tuple:
+    if n == 512:
+        return (
+            n,
+            _qr512_blocked_cuda_panel_b(),
+            _qr512_blocked_cuda_tile_n(),
+            _qr512_blocked_cuda_compact_wy_tile_cols(),
+            _qr512_blocked_cuda_ctas_per_matrix(),
+            _qr512_blocked_cuda_threads_per_cta(),
+            _dense_tail_cut(n),
+            _mixed_dense_tail_cut(n),
+            _dense_tail_threshold(n),
+            _mixed_dense_tail_threshold(n),
+            _dense_tail_force(n),
+            _qr512_blocked_cuda_policy_sample_rows(),
+            _qr512_blocked_cuda_policy_full_scan(),
+            _qr512_blocked_cuda_precision_mode(),
+            _qr512_blocked_cuda_update_mode(),
+            _qr512_blocked_cuda_panel_refresh_mode(),
+            _qr512_blocked_cuda_r_maintenance_mode(),
+            _qr512_blocked_cuda_panel_refresh_period(),
+            _qr512_blocked_cuda_r_maintenance_period(),
+            _qr512_blocked_cuda_sync_free_auto_policy(),
+            _qr512_blocked_cuda_cta_schedule(),
+            _policy_scaled_tail_ratio(n),
+        )
+    if n == 1024:
+        return (
+            n,
+            _qr1024_blocked_cuda_panel_b(),
+            _qr1024_blocked_cuda_tile_n(),
+            _qr1024_blocked_cuda_compact_wy_tile_cols(),
+            _qr1024_blocked_cuda_ctas_per_matrix(),
+            _qr1024_blocked_cuda_threads_per_cta(),
+            _dense_tail_cut(n),
+            _mixed_dense_tail_cut(n),
+            _dense_tail_threshold(n),
+            _mixed_dense_tail_threshold(n),
+            _dense_tail_force(n),
+            _qr1024_blocked_cuda_policy_sample_rows(),
+            _qr1024_blocked_cuda_policy_full_scan(),
+            _qr1024_blocked_cuda_precision_mode(),
+            _qr1024_blocked_cuda_update_mode(),
+            _qr1024_blocked_cuda_panel_refresh_mode(),
+            _qr1024_blocked_cuda_r_maintenance_mode(),
+            _qr1024_blocked_cuda_panel_refresh_period(),
+            _qr1024_blocked_cuda_r_maintenance_period(),
+            _qr1024_blocked_cuda_sync_free_auto_policy(),
+            _qr1024_blocked_cuda_cta_schedule(),
+            _policy_scaled_tail_ratio(n),
+        )
     return (
-        _QR512_BLOCKED_CUDA_SOURCE_TEMPLATE.replace("__PANEL_B__", str(_qr512_blocked_cuda_panel_b()))
-        .replace("__TILE_N__", str(_qr512_blocked_cuda_tile_n()))
-        .replace("__COMPACT_WY_TILE_COLS__", str(_qr512_blocked_cuda_compact_wy_tile_cols()))
-        .replace("__CTAS_PER_MATRIX__", str(_qr512_blocked_cuda_ctas_per_matrix()))
-        .replace("__BLOCK_THREADS__", str(_qr512_blocked_cuda_threads_per_cta()))
-        .replace("__DENSE_TAIL_CUT__", str(_dense_tail_cut(512)))
-        .replace("__MIXED_DENSE_TAIL_CUT__", str(_mixed_dense_tail_cut(512)))
-        .replace("__DENSE_TAIL_THRESHOLD__", f"{_dense_tail_threshold(512):.9e}f")
-        .replace("__MIXED_DENSE_TAIL_THRESHOLD__", f"{_mixed_dense_tail_threshold(512):.9e}f")
-        .replace("__DENSE_TAIL_FORCE__", str(1 if _dense_tail_force(512) else 0))
-        .replace("__POLICY_RANDOM_ROWS__", str(_qr512_blocked_cuda_policy_sample_rows()))
-        .replace("__USE_FULL_POLICY_SCAN__", str(1 if _qr512_blocked_cuda_policy_full_scan() else 0))
-        .replace(
-            "__USE_TF32_INPUT_UPDATE__",
-            str(1 if _qr512_blocked_cuda_precision_mode() == "tf32-input" else 0),
-        )
-        .replace(
-            "__USE_FP16_INPUT_UPDATE__",
-            str(1 if _qr512_blocked_cuda_precision_mode() == "fp16-input" else 0),
-        )
-        .replace(
-            "__USE_COMPACT_WY_UPDATE__",
-            str(1 if _qr512_blocked_cuda_update_mode() == "compact-wy" else 0),
-        )
-        .replace(
-            "__USE_PANEL_REFRESH_PREFIX__",
-            str(1 if _qr512_blocked_cuda_panel_refresh_mode() == "prefix" else 0),
-        )
-        .replace(
-            "__USE_R_MAINTENANCE_PANEL_PREFIX__",
-            str(1 if _qr512_blocked_cuda_r_maintenance_mode() == "panel-prefix" else 0),
-        )
-        .replace("__PANEL_REFRESH_PERIOD__", str(_qr512_blocked_cuda_panel_refresh_period()))
-        .replace("__R_MAINTENANCE_PERIOD__", str(_qr512_blocked_cuda_r_maintenance_period()))
-        .replace("__SYNC_FREE_AUTO_POLICY__", str(1 if _qr512_blocked_cuda_sync_free_auto_policy() else 0))
-        .replace(
-            "__CTA_SCHEDULE_FRONTLOAD__",
-            str(1 if _qr512_blocked_cuda_cta_schedule() == "frontload" else 0),
-        )
-        .replace(
-            "__CTA_SCHEDULE_ALL_TILES__",
-            str(1 if _qr512_blocked_cuda_cta_schedule() == "all-tiles" else 0),
-        )
-        .replace("__POLICY_SCALED_TAIL_RATIO__", f"{_policy_scaled_tail_ratio(512):.9e}f")
+        n,
+        _generic_blocked_cuda_panel_b(n),
+        _generic_blocked_cuda_tile_n(n),
+        _generic_blocked_cuda_compact_wy_tile_cols(n),
+        _generic_blocked_cuda_ctas_per_matrix(n),
+        _generic_blocked_cuda_threads_per_cta(n),
+        _dense_tail_cut(n),
+        _mixed_dense_tail_cut(n),
+        _dense_tail_threshold(n),
+        _mixed_dense_tail_threshold(n),
+        _dense_tail_force(n),
+        _generic_blocked_cuda_policy_sample_rows(n),
+        _generic_blocked_cuda_policy_full_scan(n),
+        _generic_blocked_cuda_precision_mode(n),
+        _generic_blocked_cuda_update_mode(n),
+        _generic_blocked_cuda_panel_refresh_mode(n),
+        _generic_blocked_cuda_r_maintenance_mode(n),
+        _generic_blocked_cuda_panel_refresh_period(n),
+        _generic_blocked_cuda_r_maintenance_period(n),
+        _generic_blocked_cuda_sync_free_auto_policy(n),
+        _generic_blocked_cuda_cta_schedule(n),
+        _policy_scaled_tail_ratio(n),
     )
+
+
+def _blocked_cuda_source_from_config(config: tuple) -> str:
+    (
+        n,
+        panel_b,
+        tile_n,
+        compact_wy_tile_cols,
+        ctas_per_matrix,
+        block_threads,
+        dense_tail_cut,
+        mixed_dense_tail_cut,
+        dense_tail_threshold,
+        mixed_dense_tail_threshold,
+        dense_tail_force,
+        policy_random_rows,
+        use_full_policy_scan,
+        precision_mode,
+        update_mode,
+        panel_refresh_mode,
+        r_maintenance_mode,
+        panel_refresh_period,
+        r_maintenance_period,
+        sync_free_auto_policy,
+        cta_schedule,
+        policy_scaled_tail_ratio,
+    ) = config
+    return (
+        _blocked_cuda_source_template_for_n(n)
+        .replace("__PANEL_B__", str(panel_b))
+        .replace("__TILE_N__", str(tile_n))
+        .replace("__COMPACT_WY_TILE_COLS__", str(compact_wy_tile_cols))
+        .replace("__CTAS_PER_MATRIX__", str(ctas_per_matrix))
+        .replace("__BLOCK_THREADS__", str(block_threads))
+        .replace("__DENSE_TAIL_CUT__", str(dense_tail_cut))
+        .replace("__MIXED_DENSE_TAIL_CUT__", str(mixed_dense_tail_cut))
+        .replace("__DENSE_TAIL_THRESHOLD__", f"{dense_tail_threshold:.9e}f")
+        .replace("__MIXED_DENSE_TAIL_THRESHOLD__", f"{mixed_dense_tail_threshold:.9e}f")
+        .replace("__DENSE_TAIL_FORCE__", str(1 if dense_tail_force else 0))
+        .replace("__POLICY_RANDOM_ROWS__", str(policy_random_rows))
+        .replace("__USE_FULL_POLICY_SCAN__", str(1 if use_full_policy_scan else 0))
+        .replace("__USE_TF32_INPUT_UPDATE__", str(1 if precision_mode == "tf32-input" else 0))
+        .replace("__USE_FP16_INPUT_UPDATE__", str(1 if precision_mode == "fp16-input" else 0))
+        .replace("__USE_COMPACT_WY_UPDATE__", str(1 if update_mode == "compact-wy" else 0))
+        .replace("__USE_PANEL_REFRESH_PREFIX__", str(1 if panel_refresh_mode == "prefix" else 0))
+        .replace("__USE_R_MAINTENANCE_PANEL_PREFIX__", str(1 if r_maintenance_mode == "panel-prefix" else 0))
+        .replace("__PANEL_REFRESH_PERIOD__", str(panel_refresh_period))
+        .replace("__R_MAINTENANCE_PERIOD__", str(r_maintenance_period))
+        .replace("__SYNC_FREE_AUTO_POLICY__", str(1 if sync_free_auto_policy else 0))
+        .replace("__CTA_SCHEDULE_FRONTLOAD__", str(1 if cta_schedule == "frontload" else 0))
+        .replace("__CTA_SCHEDULE_ALL_TILES__", str(1 if cta_schedule == "all-tiles" else 0))
+        .replace("__POLICY_SCALED_TAIL_RATIO__", f"{policy_scaled_tail_ratio:.9e}f")
+    )
+
+
+def _blocked_cuda_source_cached(n: int) -> str:
+    config = _blocked_cuda_source_config(n)
+    cached = _BLOCKED_CUDA_SOURCE_CACHE.get(config)
+    if cached is not None:
+        return cached
+    source = _blocked_cuda_source_from_config(config)
+    _BLOCKED_CUDA_SOURCE_CACHE[config] = source
+    return source
+
+
+def _blocked_cuda_extension_build_key_cached(n: int) -> str:
+    config = _blocked_cuda_source_config(n)
+    flags = tuple(
+        _qr512_blocked_cuda_extra_cuda_cflags()
+        if n == 512
+        else _qr1024_blocked_cuda_extra_cuda_cflags()
+        if n == 1024
+        else _generic_blocked_cuda_extra_cuda_cflags(n)
+    )
+    cache_key = (n, config, _BLOCKED_CUDA_ABI_VERSION, flags)
+    cached = _BLOCKED_CUDA_BUILD_KEY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    payload = "\0".join(
+        [
+            _blocked_cpp_source_for_n(n),
+            _blocked_cuda_source_cached(n),
+            _BLOCKED_CUDA_ABI_VERSION,
+            *(str(value) for value in config),
+            *flags,
+        ]
+    )
+    build_key = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    _BLOCKED_CUDA_BUILD_KEY_CACHE[cache_key] = build_key
+    return build_key
+
+
+def _qr512_blocked_cuda_source() -> str:
+    return _blocked_cuda_source_cached(512)
 
 
 def _qr512_blocked_cuda_extension_build_key() -> str:
-    payload = "\0".join(
-        [
-            _QR512_BLOCKED_CPP_SOURCE,
-            _qr512_blocked_cuda_source(),
-            _BLOCKED_CUDA_ABI_VERSION,
-            str(_qr512_blocked_cuda_threads_per_cta()),
-            str(_qr512_blocked_cuda_panel_b()),
-            str(_qr512_blocked_cuda_tile_n()),
-            str(_qr512_blocked_cuda_compact_wy_tile_cols()),
-            str(_qr512_blocked_cuda_ctas_per_matrix()),
-            _qr512_blocked_cuda_cta_schedule(),
-            str(_mixed_dense_tail_cut(512)),
-            str(_qr512_blocked_cuda_policy_sample_rows()),
-            str(_qr512_blocked_cuda_policy_full_scan()),
-            _qr512_blocked_cuda_update_mode(),
-            _qr512_blocked_cuda_precision_mode(),
-            _qr512_blocked_cuda_panel_refresh_mode(),
-            _qr512_blocked_cuda_r_maintenance_mode(),
-            str(_qr512_blocked_cuda_panel_refresh_period()),
-            str(_qr512_blocked_cuda_r_maintenance_period()),
-            str(_qr512_blocked_cuda_sync_free_auto_policy()),
-            *_qr512_blocked_cuda_extra_cuda_cflags(),
-        ]
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    return _blocked_cuda_extension_build_key_cached(512)
 
 
 def _qr512_blocked_cuda_extension_name() -> str:
@@ -4892,8 +5185,7 @@ def _qr512_blocked_cuda_try(
         if _qr512_blocked_cuda_required():
             _fail_qr512_blocked_cuda(f"qr512 blocked CUDA factor_cols must be in [1, {n}], got {cols}", data)
         return None
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
+    h, tau = allocate_h_tau(batch, n, data)
     try:
         extension.geqrf512_blocked(data, h, tau, cols, bool(project_tail))
     except Exception as exc:
@@ -5133,32 +5425,42 @@ def _blocked_auto_policy_indexed_try(
     return True
 
 
-def _qr512_blocked_cuda_auto_try(data: torch.Tensor) -> output_t | None:
-    if not data.is_cuda:
-        if _qr512_blocked_cuda_required():
-            _fail_qr512_blocked_cuda("qr512 auto blocked CUDA extension requires CUDA input")
-        return None
-    if data.dtype != torch.float32 or data.ndim != 3 or data.shape[-2:] != (512, 512):
-        if _qr512_blocked_cuda_required():
-            _fail_qr512_blocked_cuda(
-                "qr512 auto blocked CUDA extension requires float32 input with shape (batch, 512, 512)"
-            )
-        return None
+def _qr512_blocked_cuda_auto_try(
+    data: torch.Tensor,
+    *,
+    trusted_public_shape: bool = False,
+) -> output_t | None:
+    if not trusted_public_shape:
+        if not data.is_cuda:
+            if _qr512_blocked_cuda_required():
+                _fail_qr512_blocked_cuda("qr512 auto blocked CUDA extension requires CUDA input")
+            return None
+        if data.dtype != torch.float32 or data.ndim != 3 or data.shape[-2:] != (512, 512):
+            if _qr512_blocked_cuda_required():
+                _fail_qr512_blocked_cuda(
+                    "qr512 auto blocked CUDA extension requires float32 input with shape (batch, 512, 512)"
+                )
+            return None
 
     extension = _load_qr512_blocked_cuda_extension(data)
     if extension is None:
         return None
 
     batch, n, _ = data.shape
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
+    cache_enabled = _output_workspace_cache_enabled(data)
+    h = allocate_column_major_H(batch, n, data, cache_enabled=cache_enabled)
+    tau = allocate_tau(batch, n, data, cache_enabled=cache_enabled)
     try:
         if _qr512_blocked_cuda_sync_free_auto_policy() and hasattr(
             extension,
             "geqrf512_blocked_auto_workspace",
         ):
-            factor_cols, project_tail = allocate_blocked_policy_workspace(data, 512)
-            extension.geqrf512_blocked_auto_workspace(data, h, tau, factor_cols, project_tail)
+            factor_cols, project_tail, has_structured = allocate_blocked_policy_workspace(
+                data,
+                512,
+                cache_enabled=cache_enabled,
+            )
+            extension.geqrf512_blocked_auto_workspace(data, h, tau, factor_cols, project_tail, has_structured)
         elif _qr512_blocked_cuda_sync_free_auto_policy() and hasattr(extension, "geqrf512_blocked_auto"):
             extension.geqrf512_blocked_auto(data, h, tau)
         elif hasattr(extension, "geqrf512_blocked_make_policy") and hasattr(extension, "geqrf512_blocked_policy"):
@@ -5214,13 +5516,23 @@ def _qr512_blocked_cuda_auto_try(data: torch.Tensor) -> output_t | None:
 
 def _qr512_blocked_cuda_fast(data: torch.Tensor) -> output_t:
     output = _qr512_blocked_cuda_try(data)
-    if output is None:
-        return _geqrf_fallback(data)
-    return output
+    if output is not None:
+        return output
+    output = _qr512_cuda_try(data)
+    if output is not None:
+        return output
+    return _generic_blocked_cuda_dense_tail_or_geqrf_fallback(data, 512)
 
 
 def _qr512_blocked_cuda_auto_fast(data: torch.Tensor) -> output_t:
     output = _qr512_blocked_cuda_auto_try(data)
+    if output is None:
+        return _qr512_blocked_cuda_fast(data)
+    return output
+
+
+def _qr512_blocked_cuda_auto_public_fast(data: torch.Tensor) -> output_t:
+    output = _qr512_blocked_cuda_auto_try(data, trusted_public_shape=True)
     if output is None:
         return _qr512_blocked_cuda_fast(data)
     return output
@@ -5257,21 +5569,13 @@ def _qr512_cuda_extra_cuda_cflags() -> list[str]:
 
 
 def _qr512_cuda_extension_build_key() -> str:
-    payload = "\0".join(
-        [
-            _QR512_CPP_SOURCE,
-            _qr512_cuda_source(),
-            str(_qr512_cuda_threads_per_cta()),
-            str(_qr512_cuda_update_col_tile()),
-            str(_qr512_cuda_panel_b()),
-            _qr512_cuda_update_mode(),
-            _qr512_cuda_precision_mode(),
-            _qr512_cuda_panel_refresh_mode(),
-            _qr512_cuda_r_maintenance_mode(),
-            *_qr512_cuda_extra_cuda_cflags(),
-        ]
+    config = _qr512_cuda_config()
+    return _one_cta_cuda_build_key_cached(
+        config,
+        _QR512_CPP_SOURCE,
+        _qr512_cuda_source(),
+        _qr512_cuda_extra_cuda_cflags(),
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _qr512_cuda_extension_name() -> str:
@@ -5354,8 +5658,7 @@ def _qr512_cuda_try(data: torch.Tensor) -> output_t | None:
         return None
 
     batch, n, _ = data.shape
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
+    h, tau = allocate_h_tau(batch, n, data)
     try:
         extension.geqrf512(data, h, tau)
     except Exception as exc:
@@ -5489,80 +5792,11 @@ def _qr1024_blocked_cuda_sync_free_auto_policy() -> bool:
 
 
 def _qr1024_blocked_cuda_source() -> str:
-    return (
-        _QR1024_BLOCKED_CUDA_SOURCE_TEMPLATE.replace("__PANEL_B__", str(_qr1024_blocked_cuda_panel_b()))
-        .replace("__TILE_N__", str(_qr1024_blocked_cuda_tile_n()))
-        .replace("__COMPACT_WY_TILE_COLS__", str(_qr1024_blocked_cuda_compact_wy_tile_cols()))
-        .replace("__CTAS_PER_MATRIX__", str(_qr1024_blocked_cuda_ctas_per_matrix()))
-        .replace("__BLOCK_THREADS__", str(_qr1024_blocked_cuda_threads_per_cta()))
-        .replace("__DENSE_TAIL_CUT__", str(_dense_tail_cut(1024)))
-        .replace("__MIXED_DENSE_TAIL_CUT__", str(_mixed_dense_tail_cut(1024)))
-        .replace("__DENSE_TAIL_THRESHOLD__", f"{_dense_tail_threshold(1024):.9e}f")
-        .replace("__MIXED_DENSE_TAIL_THRESHOLD__", f"{_mixed_dense_tail_threshold(1024):.9e}f")
-        .replace("__DENSE_TAIL_FORCE__", str(1 if _dense_tail_force(1024) else 0))
-        .replace("__POLICY_RANDOM_ROWS__", str(_qr1024_blocked_cuda_policy_sample_rows()))
-        .replace("__USE_FULL_POLICY_SCAN__", str(1 if _qr1024_blocked_cuda_policy_full_scan() else 0))
-        .replace(
-            "__USE_TF32_INPUT_UPDATE__",
-            str(1 if _qr1024_blocked_cuda_precision_mode() == "tf32-input" else 0),
-        )
-        .replace(
-            "__USE_FP16_INPUT_UPDATE__",
-            str(1 if _qr1024_blocked_cuda_precision_mode() == "fp16-input" else 0),
-        )
-        .replace(
-            "__USE_COMPACT_WY_UPDATE__",
-            str(1 if _qr1024_blocked_cuda_update_mode() == "compact-wy" else 0),
-        )
-        .replace(
-            "__USE_PANEL_REFRESH_PREFIX__",
-            str(1 if _qr1024_blocked_cuda_panel_refresh_mode() == "prefix" else 0),
-        )
-        .replace(
-            "__USE_R_MAINTENANCE_PANEL_PREFIX__",
-            str(1 if _qr1024_blocked_cuda_r_maintenance_mode() == "panel-prefix" else 0),
-        )
-        .replace("__PANEL_REFRESH_PERIOD__", str(_qr1024_blocked_cuda_panel_refresh_period()))
-        .replace("__R_MAINTENANCE_PERIOD__", str(_qr1024_blocked_cuda_r_maintenance_period()))
-        .replace("__SYNC_FREE_AUTO_POLICY__", str(1 if _qr1024_blocked_cuda_sync_free_auto_policy() else 0))
-        .replace(
-            "__CTA_SCHEDULE_FRONTLOAD__",
-            str(1 if _qr1024_blocked_cuda_cta_schedule() == "frontload" else 0),
-        )
-        .replace(
-            "__CTA_SCHEDULE_ALL_TILES__",
-            str(1 if _qr1024_blocked_cuda_cta_schedule() == "all-tiles" else 0),
-        )
-        .replace("__POLICY_SCALED_TAIL_RATIO__", f"{_policy_scaled_tail_ratio(1024):.9e}f")
-    )
+    return _blocked_cuda_source_cached(1024)
 
 
 def _qr1024_blocked_cuda_extension_build_key() -> str:
-    payload = "\0".join(
-        [
-            _QR1024_BLOCKED_CPP_SOURCE,
-            _qr1024_blocked_cuda_source(),
-            _BLOCKED_CUDA_ABI_VERSION,
-            str(_qr1024_blocked_cuda_threads_per_cta()),
-            str(_qr1024_blocked_cuda_panel_b()),
-            str(_qr1024_blocked_cuda_tile_n()),
-            str(_qr1024_blocked_cuda_compact_wy_tile_cols()),
-            str(_qr1024_blocked_cuda_ctas_per_matrix()),
-            _qr1024_blocked_cuda_cta_schedule(),
-            str(_mixed_dense_tail_cut(1024)),
-            str(_qr1024_blocked_cuda_policy_sample_rows()),
-            str(_qr1024_blocked_cuda_policy_full_scan()),
-            _qr1024_blocked_cuda_update_mode(),
-            _qr1024_blocked_cuda_precision_mode(),
-            _qr1024_blocked_cuda_panel_refresh_mode(),
-            _qr1024_blocked_cuda_r_maintenance_mode(),
-            str(_qr1024_blocked_cuda_panel_refresh_period()),
-            str(_qr1024_blocked_cuda_r_maintenance_period()),
-            str(_qr1024_blocked_cuda_sync_free_auto_policy()),
-            *_qr1024_blocked_cuda_extra_cuda_cflags(),
-        ]
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    return _blocked_cuda_extension_build_key_cached(1024)
 
 
 def _qr1024_blocked_cuda_extension_name() -> str:
@@ -5681,8 +5915,7 @@ def _qr1024_blocked_cuda_try(
         if _qr1024_blocked_cuda_required():
             _fail_qr1024_blocked_cuda(f"qr1024 blocked CUDA factor_cols must be in [1, {n}], got {cols}", data)
         return None
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
+    h, tau = allocate_h_tau(batch, n, data)
     try:
         extension.geqrf1024_blocked(data, h, tau, cols, bool(project_tail))
     except Exception as exc:
@@ -5744,32 +5977,42 @@ def _qr1024_blocked_cuda_try_into(
     return True
 
 
-def _qr1024_blocked_cuda_auto_try(data: torch.Tensor) -> output_t | None:
-    if not data.is_cuda:
-        if _qr1024_blocked_cuda_required():
-            _fail_qr1024_blocked_cuda("qr1024 auto blocked CUDA extension requires CUDA input")
-        return None
-    if data.dtype != torch.float32 or data.ndim != 3 or data.shape[-2:] != (1024, 1024):
-        if _qr1024_blocked_cuda_required():
-            _fail_qr1024_blocked_cuda(
-                "qr1024 auto blocked CUDA extension requires float32 input with shape (batch, 1024, 1024)"
-            )
-        return None
+def _qr1024_blocked_cuda_auto_try(
+    data: torch.Tensor,
+    *,
+    trusted_public_shape: bool = False,
+) -> output_t | None:
+    if not trusted_public_shape:
+        if not data.is_cuda:
+            if _qr1024_blocked_cuda_required():
+                _fail_qr1024_blocked_cuda("qr1024 auto blocked CUDA extension requires CUDA input")
+            return None
+        if data.dtype != torch.float32 or data.ndim != 3 or data.shape[-2:] != (1024, 1024):
+            if _qr1024_blocked_cuda_required():
+                _fail_qr1024_blocked_cuda(
+                    "qr1024 auto blocked CUDA extension requires float32 input with shape (batch, 1024, 1024)"
+                )
+            return None
 
     extension = _load_qr1024_blocked_cuda_extension(data)
     if extension is None:
         return None
 
     batch, n, _ = data.shape
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
+    cache_enabled = _output_workspace_cache_enabled(data)
+    h = allocate_column_major_H(batch, n, data, cache_enabled=cache_enabled)
+    tau = allocate_tau(batch, n, data, cache_enabled=cache_enabled)
     try:
         if _qr1024_blocked_cuda_sync_free_auto_policy() and hasattr(
             extension,
             "geqrf1024_blocked_auto_workspace",
         ):
-            factor_cols, project_tail = allocate_blocked_policy_workspace(data, 1024)
-            extension.geqrf1024_blocked_auto_workspace(data, h, tau, factor_cols, project_tail)
+            factor_cols, project_tail, has_structured = allocate_blocked_policy_workspace(
+                data,
+                1024,
+                cache_enabled=cache_enabled,
+            )
+            extension.geqrf1024_blocked_auto_workspace(data, h, tau, factor_cols, project_tail, has_structured)
         elif _qr1024_blocked_cuda_sync_free_auto_policy() and hasattr(extension, "geqrf1024_blocked_auto"):
             extension.geqrf1024_blocked_auto(data, h, tau)
         elif hasattr(extension, "geqrf1024_blocked_make_policy") and hasattr(extension, "geqrf1024_blocked_policy"):
@@ -5825,13 +6068,23 @@ def _qr1024_blocked_cuda_auto_try(data: torch.Tensor) -> output_t | None:
 
 def _qr1024_blocked_cuda_fast(data: torch.Tensor) -> output_t:
     output = _qr1024_blocked_cuda_try(data)
-    if output is None:
-        return _geqrf_fallback(data)
-    return output
+    if output is not None:
+        return output
+    output = _qr1024_cuda_try(data)
+    if output is not None:
+        return output
+    return _generic_blocked_cuda_dense_tail_or_geqrf_fallback(data, 1024)
 
 
 def _qr1024_blocked_cuda_auto_fast(data: torch.Tensor) -> output_t:
     output = _qr1024_blocked_cuda_auto_try(data)
+    if output is None:
+        return _qr1024_blocked_cuda_fast(data)
+    return output
+
+
+def _qr1024_blocked_cuda_auto_public_fast(data: torch.Tensor) -> output_t:
+    output = _qr1024_blocked_cuda_auto_try(data, trusted_public_shape=True)
     if output is None:
         return _qr1024_blocked_cuda_fast(data)
     return output
@@ -5981,81 +6234,11 @@ def _generic_blocked_cuda_sync_free_auto_policy(n: int) -> bool:
 
 
 def _generic_blocked_cuda_source(n: int) -> str:
-    return (
-        _blocked_cuda_source_template_for_n(n)
-        .replace("__PANEL_B__", str(_generic_blocked_cuda_panel_b(n)))
-        .replace("__TILE_N__", str(_generic_blocked_cuda_tile_n(n)))
-        .replace("__COMPACT_WY_TILE_COLS__", str(_generic_blocked_cuda_compact_wy_tile_cols(n)))
-        .replace("__CTAS_PER_MATRIX__", str(_generic_blocked_cuda_ctas_per_matrix(n)))
-        .replace("__BLOCK_THREADS__", str(_generic_blocked_cuda_threads_per_cta(n)))
-        .replace("__DENSE_TAIL_CUT__", str(_dense_tail_cut(n)))
-        .replace("__MIXED_DENSE_TAIL_CUT__", str(_mixed_dense_tail_cut(n)))
-        .replace("__DENSE_TAIL_THRESHOLD__", f"{_dense_tail_threshold(n):.9e}f")
-        .replace("__MIXED_DENSE_TAIL_THRESHOLD__", f"{_mixed_dense_tail_threshold(n):.9e}f")
-        .replace("__DENSE_TAIL_FORCE__", str(1 if _dense_tail_force(n) else 0))
-        .replace("__POLICY_RANDOM_ROWS__", str(_generic_blocked_cuda_policy_sample_rows(n)))
-        .replace("__USE_FULL_POLICY_SCAN__", str(1 if _generic_blocked_cuda_policy_full_scan(n) else 0))
-        .replace(
-            "__USE_TF32_INPUT_UPDATE__",
-            str(1 if _generic_blocked_cuda_precision_mode(n) == "tf32-input" else 0),
-        )
-        .replace(
-            "__USE_FP16_INPUT_UPDATE__",
-            str(1 if _generic_blocked_cuda_precision_mode(n) == "fp16-input" else 0),
-        )
-        .replace(
-            "__USE_COMPACT_WY_UPDATE__",
-            str(1 if _generic_blocked_cuda_update_mode(n) == "compact-wy" else 0),
-        )
-        .replace(
-            "__USE_PANEL_REFRESH_PREFIX__",
-            str(1 if _generic_blocked_cuda_panel_refresh_mode(n) == "prefix" else 0),
-        )
-        .replace(
-            "__USE_R_MAINTENANCE_PANEL_PREFIX__",
-            str(1 if _generic_blocked_cuda_r_maintenance_mode(n) == "panel-prefix" else 0),
-        )
-        .replace("__PANEL_REFRESH_PERIOD__", str(_generic_blocked_cuda_panel_refresh_period(n)))
-        .replace("__R_MAINTENANCE_PERIOD__", str(_generic_blocked_cuda_r_maintenance_period(n)))
-        .replace("__SYNC_FREE_AUTO_POLICY__", str(1 if _generic_blocked_cuda_sync_free_auto_policy(n) else 0))
-        .replace(
-            "__CTA_SCHEDULE_FRONTLOAD__",
-            str(1 if _generic_blocked_cuda_cta_schedule(n) == "frontload" else 0),
-        )
-        .replace(
-            "__CTA_SCHEDULE_ALL_TILES__",
-            str(1 if _generic_blocked_cuda_cta_schedule(n) == "all-tiles" else 0),
-        )
-        .replace("__POLICY_SCALED_TAIL_RATIO__", f"{_policy_scaled_tail_ratio(n):.9e}f")
-    )
+    return _blocked_cuda_source_cached(n)
 
 
 def _generic_blocked_cuda_extension_build_key(n: int) -> str:
-    payload = "\0".join(
-        [
-            _blocked_cpp_source_for_n(n),
-            _generic_blocked_cuda_source(n),
-            _BLOCKED_CUDA_ABI_VERSION,
-            str(_generic_blocked_cuda_threads_per_cta(n)),
-            str(_generic_blocked_cuda_panel_b(n)),
-            str(_generic_blocked_cuda_tile_n(n)),
-            str(_generic_blocked_cuda_compact_wy_tile_cols(n)),
-            str(_generic_blocked_cuda_ctas_per_matrix(n)),
-            _generic_blocked_cuda_cta_schedule(n),
-            str(_mixed_dense_tail_cut(n)),
-            str(_generic_blocked_cuda_policy_sample_rows(n)),
-            str(_generic_blocked_cuda_policy_full_scan(n)),
-            _generic_blocked_cuda_update_mode(n),
-            _generic_blocked_cuda_precision_mode(n),
-            _generic_blocked_cuda_panel_refresh_mode(n),
-            _generic_blocked_cuda_r_maintenance_mode(n),
-            str(_generic_blocked_cuda_panel_refresh_period(n)),
-            str(_generic_blocked_cuda_r_maintenance_period(n)),
-            str(_generic_blocked_cuda_sync_free_auto_policy(n)),
-            *_generic_blocked_cuda_extra_cuda_cflags(n),
-        ]
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    return _blocked_cuda_extension_build_key_cached(n)
 
 
 def _generic_blocked_cuda_extension_name(n: int) -> str:
@@ -6185,8 +6368,7 @@ def _generic_blocked_cuda_try(
         if _generic_blocked_cuda_required(n):
             _fail_generic_blocked_cuda(n, f"qr{n} blocked CUDA factor_cols must be in [1, {n}], got {cols}", data)
         return None
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
+    h, tau = allocate_h_tau(batch, n, data)
     try:
         getattr(extension, f"geqrf{n}_blocked")(data, h, tau, cols, bool(project_tail))
     except Exception as exc:
@@ -6254,27 +6436,34 @@ def _generic_blocked_cuda_try_into(
     return True
 
 
-def _generic_blocked_cuda_auto_try(data: torch.Tensor, n: int) -> output_t | None:
-    if not data.is_cuda:
-        if _generic_blocked_cuda_required(n):
-            _fail_generic_blocked_cuda(n, f"qr{n} auto blocked CUDA extension requires CUDA input")
-        return None
-    if data.dtype != torch.float32 or data.ndim != 3 or data.shape[-2:] != (n, n):
-        if _generic_blocked_cuda_required(n):
-            _fail_generic_blocked_cuda(
-                n,
-                f"qr{n} auto blocked CUDA extension requires float32 input with shape (batch, {n}, {n})",
-                data,
-            )
-        return None
+def _generic_blocked_cuda_auto_try(
+    data: torch.Tensor,
+    n: int,
+    *,
+    trusted_public_shape: bool = False,
+) -> output_t | None:
+    if not trusted_public_shape:
+        if not data.is_cuda:
+            if _generic_blocked_cuda_required(n):
+                _fail_generic_blocked_cuda(n, f"qr{n} auto blocked CUDA extension requires CUDA input")
+            return None
+        if data.dtype != torch.float32 or data.ndim != 3 or data.shape[-2:] != (n, n):
+            if _generic_blocked_cuda_required(n):
+                _fail_generic_blocked_cuda(
+                    n,
+                    f"qr{n} auto blocked CUDA extension requires float32 input with shape (batch, {n}, {n})",
+                    data,
+                )
+            return None
 
     extension = _load_generic_blocked_cuda_extension(n, data)
     if extension is None:
         return None
 
     batch, _, _ = data.shape
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
+    cache_enabled = _output_workspace_cache_enabled(data)
+    h = allocate_column_major_H(batch, n, data, cache_enabled=cache_enabled)
+    tau = allocate_tau(batch, n, data, cache_enabled=cache_enabled)
     auto_name = f"geqrf{n}_blocked_auto"
     auto_workspace_name = f"geqrf{n}_blocked_auto_workspace"
     make_policy_name = f"geqrf{n}_blocked_make_policy"
@@ -6283,8 +6472,12 @@ def _generic_blocked_cuda_auto_try(data: torch.Tensor, n: int) -> output_t | Non
     blocked_name = f"geqrf{n}_blocked"
     try:
         if _generic_blocked_cuda_sync_free_auto_policy(n) and hasattr(extension, auto_workspace_name):
-            factor_cols, project_tail = allocate_blocked_policy_workspace(data, n)
-            getattr(extension, auto_workspace_name)(data, h, tau, factor_cols, project_tail)
+            factor_cols, project_tail, has_structured = allocate_blocked_policy_workspace(
+                data,
+                n,
+                cache_enabled=cache_enabled,
+            )
+            getattr(extension, auto_workspace_name)(data, h, tau, factor_cols, project_tail, has_structured)
         elif _generic_blocked_cuda_sync_free_auto_policy(n) and hasattr(extension, auto_name):
             getattr(extension, auto_name)(data, h, tau)
         elif (
@@ -6344,12 +6537,28 @@ def _generic_blocked_cuda_auto_try(data: torch.Tensor, n: int) -> output_t | Non
 def _generic_blocked_cuda_fast(data: torch.Tensor, n: int) -> output_t:
     output = _generic_blocked_cuda_try(data, n)
     if output is None:
-        return _geqrf_fallback(data)
+        return _generic_blocked_cuda_dense_tail_or_geqrf_fallback(data, n)
     return output
+
+
+def _generic_blocked_cuda_dense_tail_or_geqrf_fallback(data: torch.Tensor, n: int) -> output_t:
+    dense_tail_route = _dense_tail_route_or_fallback(data, f"qr{n}_dense_fast")
+    if dense_tail_route != "torch.geqrf":
+        cut = _dense_tail_cut(n)
+        if cut > 0:
+            return _embedded_geqrf_with_tail_projection(data, n - cut)
+    return _geqrf_fallback(data)
 
 
 def _generic_blocked_cuda_auto_fast(data: torch.Tensor, n: int) -> output_t:
     output = _generic_blocked_cuda_auto_try(data, n)
+    if output is None:
+        return _generic_blocked_cuda_fast(data, n)
+    return output
+
+
+def _generic_blocked_cuda_auto_public_fast(data: torch.Tensor, n: int) -> output_t:
+    output = _generic_blocked_cuda_auto_try(data, n, trusted_public_shape=True)
     if output is None:
         return _generic_blocked_cuda_fast(data, n)
     return output
@@ -6464,6 +6673,10 @@ def _qr2048_blocked_cuda_auto_fast(data: torch.Tensor) -> output_t:
     return _generic_blocked_cuda_auto_fast(data, 2048)
 
 
+def _qr2048_blocked_cuda_auto_public_fast(data: torch.Tensor) -> output_t:
+    return _generic_blocked_cuda_auto_public_fast(data, 2048)
+
+
 def _qr2048_blocked_cuda_tail_project_fast(data: torch.Tensor, factor_cols: int) -> output_t:
     return _generic_blocked_cuda_tail_project_fast(data, 2048, factor_cols)
 
@@ -6560,6 +6773,10 @@ def _qr4096_blocked_cuda_auto_fast(data: torch.Tensor) -> output_t:
     return _generic_blocked_cuda_auto_fast(data, 4096)
 
 
+def _qr4096_blocked_cuda_auto_public_fast(data: torch.Tensor) -> output_t:
+    return _generic_blocked_cuda_auto_public_fast(data, 4096)
+
+
 def _qr4096_blocked_cuda_tail_project_fast(data: torch.Tensor, factor_cols: int) -> output_t:
     return _generic_blocked_cuda_tail_project_fast(data, 4096, factor_cols)
 
@@ -6578,21 +6795,13 @@ def _qr1024_cuda_extra_cuda_cflags() -> list[str]:
 
 
 def _qr1024_cuda_extension_build_key() -> str:
-    payload = "\0".join(
-        [
-            _QR1024_CPP_SOURCE,
-            _qr1024_cuda_source(),
-            str(_qr1024_cuda_threads_per_cta()),
-            str(_qr1024_cuda_update_col_tile()),
-            str(_qr1024_cuda_panel_b()),
-            _qr1024_cuda_update_mode(),
-            _qr1024_cuda_precision_mode(),
-            _qr1024_cuda_panel_refresh_mode(),
-            _qr1024_cuda_r_maintenance_mode(),
-            *_qr1024_cuda_extra_cuda_cflags(),
-        ]
+    config = _qr1024_cuda_config()
+    return _one_cta_cuda_build_key_cached(
+        config,
+        _QR1024_CPP_SOURCE,
+        _qr1024_cuda_source(),
+        _qr1024_cuda_extra_cuda_cflags(),
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _qr1024_cuda_extension_name() -> str:
@@ -6675,8 +6884,7 @@ def _qr1024_cuda_try(data: torch.Tensor) -> output_t | None:
         return None
 
     batch, n, _ = data.shape
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
+    h, tau = allocate_h_tau(batch, n, data)
     try:
         extension.geqrf1024(data, h, tau)
     except Exception as exc:
@@ -7496,8 +7704,7 @@ def _mixed_structured_fast(data: torch.Tensor, cond: int = 2) -> output_t:
 
 def _mixed_structured_fast_from_plan(data: torch.Tensor, plan: dict) -> output_t:
     batch, n, _ = data.shape
-    h = allocate_column_major_H(batch, n, data)
-    tau = allocate_tau(batch, n, data)
+    h, tau = allocate_h_tau(batch, n, data)
 
     _scatter_factor_cols_group_indices(
         data,
@@ -7740,8 +7947,7 @@ def qr1024_fast(data: torch.Tensor) -> output_t:
 
 def qr2048_fast(data: torch.Tensor) -> output_t:
     if (
-        not _dense_tail_policy_env_explicit(2048)
-        and _qr2048_blocked_cuda_route_enabled(data)
+        _qr2048_blocked_cuda_route_enabled(data)
         and _blocked_auto_policy_enabled(data, 2048)
     ):
         return _qr2048_blocked_cuda_auto_fast(data)
@@ -7775,8 +7981,7 @@ def qr2048_mixed_fast(data: torch.Tensor) -> output_t:
 
 def qr4096_fast(data: torch.Tensor) -> output_t:
     if (
-        not _dense_tail_policy_env_explicit(4096)
-        and _qr4096_blocked_cuda_route_enabled(data)
+        _qr4096_blocked_cuda_route_enabled(data)
         and _blocked_auto_policy_enabled(data, 4096)
     ):
         return _qr4096_blocked_cuda_auto_fast(data)
@@ -7949,11 +8154,7 @@ def _compute_qr1024_route_plan(data: torch.Tensor) -> tuple[str, dict | None]:
 def _compute_qr2048_route_plan(data: torch.Tensor) -> tuple[str, dict | None]:
     batch, n, _ = data.shape
     blocked_cuda_enabled = _qr2048_blocked_cuda_route_enabled(data)
-    if (
-        not _dense_tail_policy_env_explicit(2048)
-        and blocked_cuda_enabled
-        and _blocked_auto_policy_enabled(data, 2048)
-    ):
+    if blocked_cuda_enabled and _blocked_auto_policy_enabled(data, 2048):
         return "qr2048_blocked_cuda_auto_fast", None
     if _structured_routes_enabled():
         cls = _classify_sampled(data)
@@ -7981,11 +8182,7 @@ def _compute_qr2048_route_plan(data: torch.Tensor) -> tuple[str, dict | None]:
 
 def _compute_qr4096_route_plan(data: torch.Tensor) -> tuple[str, dict | None]:
     blocked_cuda_enabled = _qr4096_blocked_cuda_route_enabled(data)
-    if (
-        not _dense_tail_policy_env_explicit(4096)
-        and blocked_cuda_enabled
-        and _blocked_auto_policy_enabled(data, 4096)
-    ):
+    if blocked_cuda_enabled and _blocked_auto_policy_enabled(data, 4096):
         return "qr4096_blocked_cuda_auto_fast", None
 
     dense_tail_route = _dense_tail_route_or_fallback(data, "qr4096_dense_fast")
@@ -8193,27 +8390,43 @@ def _dispatch_route(route: str, data: torch.Tensor, plan: dict | None = None) ->
 def custom_kernel(data: input_t) -> output_t:
     batch, n, _ = data.shape
     if batch == 20 and n == 32:
+        if getattr(data, "is_cuda", False) and getattr(data, "dtype", None) == torch.float32:
+            return _qr32_cuda_public_fast(data)
         return qr32_fast(data)
     if batch == 40 and n == 176:
+        if getattr(data, "is_cuda", False) and getattr(data, "dtype", None) == torch.float32:
+            return _qr176_cuda_public_fast(data)
         return qr176_fast(data)
     if batch == 40 and n == 352:
+        if getattr(data, "is_cuda", False) and getattr(data, "dtype", None) == torch.float32:
+            return _qr352_cuda_public_fast(data)
         return qr352_fast(data)
     if (
         batch == 640
         and n == 512
         and not _structured_before_cuda(512)
-        and _qr512_blocked_cuda_route_enabled(data)
-        and _blocked_auto_policy_enabled(data, 512)
+        and _blocked_cuda_auto_route_enabled(data, 512)
     ):
-        return qr512_blocked_cuda_auto_fast(data)
+        return _qr512_blocked_cuda_auto_public_fast(data)
     if (
         batch == 60
         and n == 1024
         and not _structured_before_cuda(1024)
-        and _qr1024_blocked_cuda_route_enabled(data)
-        and _blocked_auto_policy_enabled(data, 1024)
+        and _blocked_cuda_auto_route_enabled(data, 1024)
     ):
-        return qr1024_blocked_cuda_auto_fast(data)
+        return _qr1024_blocked_cuda_auto_public_fast(data)
+    if (
+        batch == 8
+        and n == 2048
+        and _blocked_cuda_auto_route_enabled(data, 2048)
+    ):
+        return _qr2048_blocked_cuda_auto_public_fast(data)
+    if (
+        batch == 2
+        and n == 4096
+        and _blocked_cuda_auto_route_enabled(data, 4096)
+    ):
+        return _qr4096_blocked_cuda_auto_public_fast(data)
     if batch == 8 and n == 2048:
         return qr2048_fast(data)
     if batch == 2 and n == 4096:
