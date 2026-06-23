@@ -27,6 +27,7 @@ from qr_common import (  # noqa: E402
     environment_info,
     file_provenance,
     format_case,
+    load_cases,
     load_submission,
     parse_popcorn_seed_tokens,
     TRACKED_RUNTIME_ENV_KEYS,
@@ -39,7 +40,11 @@ from benchmark_guards import measure_route_decision, route_decision  # noqa: E40
 from bench_local import parse_indices as parse_benchmark_indices  # noqa: E402
 from check_b200_env import evaluate as evaluate_b200_env  # noqa: E402
 from check_cases import parse_indices, run_case as run_check_case  # noqa: E402
-from classifier_seed_sweep import run_case as run_classifier_case, summarize as summarize_classifier_sweep  # noqa: E402
+from classifier_seed_sweep import (  # noqa: E402
+    allowed_routes as allowed_classifier_routes,
+    run_case as run_classifier_case,
+    summarize as summarize_classifier_sweep,
+)
 from diagnose import diagnose  # noqa: E402
 from experiments import (  # noqa: E402
     classify_features,
@@ -55,6 +60,7 @@ from mixed_seed_sweep import (  # noqa: E402
     run_case as run_mixed_seed_case,
     summarize as summarize_mixed_seed_sweep,
 )
+from route_expectations import allowed_family_routes, expected_case_route  # noqa: E402
 from implementation_status import readiness_rows, summarize_readiness  # noqa: E402
 from large_kernel_plan import generate_configs as generate_large_kernel_configs, tune_command as large_kernel_tune_command  # noqa: E402
 from preflight_accelerators import (  # noqa: E402
@@ -9160,6 +9166,46 @@ def test_classifier_seed_sweep_row_and_summary_on_structured_case():
     assert summary["num_classifier_mismatch"] == 0
     assert summary["num_public_seed_rows"] == 1
     assert summary["num_popcorn_seed_rows"] == 1
+
+
+def test_classifier_seed_sweep_accepts_blocked_auto_family_routes():
+    assert "qr512_blocked_cuda_auto_fast" in allowed_classifier_routes({"n": 512, "case": "dense"})
+    assert "qr512_blocked_cuda_auto_fast" in allowed_classifier_routes({"n": 512, "case": "mixed"})
+    assert "qr512_blocked_cuda_auto_fast" in allowed_classifier_routes({"n": 512, "case": "rankdef"})
+    assert "qr512_blocked_cuda_auto_fast" in allowed_classifier_routes({"n": 512, "case": "clustered"})
+    assert "qr512_rankdef_fast" not in allowed_classifier_routes({"n": 512, "case": "dense"})
+    assert "qr1024_blocked_cuda_auto_fast" in allowed_classifier_routes({"n": 1024, "case": "dense"})
+    assert "qr1024_blocked_cuda_auto_fast" in allowed_classifier_routes({"n": 1024, "case": "mixed"})
+    assert "qr1024_blocked_cuda_auto_fast" in allowed_classifier_routes({"n": 1024, "case": "nearrank"})
+    assert "qr1024_nearrank_fast" not in allowed_classifier_routes({"n": 1024, "case": "mixed"})
+
+
+def test_suite_route_gates_share_family_route_expectations():
+    gate_files = [
+        ROOT / "tools/mixed_seed_sweep.py",
+        ROOT / "tools/classifier_seed_sweep.py",
+    ]
+    for path in gate_files:
+        text = path.read_text()
+        assert "from route_expectations import" in text
+        assert "allowed_family_routes" in text
+
+
+def test_family_route_expectations_cover_current_b200_public_routes():
+    cases = load_cases(ROOT / "cases/public_benchmarks.txt")
+    expected_current_routes = {
+        512: "qr512_blocked_cuda_auto_fast",
+        1024: "qr1024_blocked_cuda_auto_fast",
+        2048: "qr2048_blocked_cuda_auto_fast",
+        4096: "qr4096_blocked_cuda_auto_fast",
+    }
+    for spec in cases:
+        n = int(spec["n"])
+        if n not in expected_current_routes:
+            continue
+        allowed = allowed_family_routes(spec)
+        assert expected_case_route(spec) in allowed
+        assert expected_current_routes[n] in allowed
 
 
 def test_submit_popcorn_helpers_stage_single_file(tmp_path):

@@ -22,6 +22,7 @@ from qr_common import (
     parse_popcorn_seed_tokens,
     validate_factor_structure,
 )
+from route_expectations import allowed_family_routes, expected_case_route
 from trace_candidate_routes import load_candidate_module, plan_diagnostics, plan_group_counts
 
 
@@ -94,21 +95,11 @@ def _timed(data: torch.Tensor, fn: Callable[[], Any]) -> tuple[Any, float, float
 
 
 def expected_mixed_route(spec: dict[str, Any]) -> str | None:
-    n = int(spec["n"])
-    if n == 512:
-        return "qr512_mixed_fast"
-    if n == 1024:
-        return "qr1024_mixed_fast"
-    return None
+    return expected_case_route(spec)
 
 
 def allowed_mixed_routes(spec: dict[str, Any]) -> set[str] | None:
-    n = int(spec["n"])
-    if n == 512:
-        return {"qr512_mixed_fast", "qr512_cuda_fast", "qr512_blocked_cuda_auto_fast"}
-    if n == 1024:
-        return {"qr1024_mixed_fast", "qr1024_cuda_fast", "qr1024_blocked_cuda_auto_fast"}
-    return None
+    return allowed_family_routes(spec)
 
 
 def actual_route_plan(candidate, data: torch.Tensor) -> tuple[str, dict[str, Any] | None]:

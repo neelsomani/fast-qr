@@ -21,6 +21,7 @@ from qr_common import (
     parse_case,
     parse_popcorn_seed_tokens,
 )
+from route_expectations import allowed_family_routes, expected_case_route
 from trace_candidate_routes import load_candidate_module, plan_group_counts
 
 
@@ -69,24 +70,11 @@ def expected_sampled_class(spec: dict[str, Any]) -> str | None:
 
 
 def expected_route(spec: dict[str, Any]) -> str | None:
-    n = int(spec["n"])
-    case = str(spec.get("case", "dense"))
-    if n == 512:
-        return {
-            "dense": "qr512_dense_fast",
-            "mixed": "qr512_mixed_fast",
-            "rankdef": "qr512_rankdef_fast",
-            "clustered": "qr512_clustered_fast",
-        }.get(case)
-    if n == 1024:
-        return {
-            "dense": "qr1024_dense_fast",
-            "mixed": "qr1024_mixed_fast",
-            "rankdef": "qr1024_rankdef_fast",
-            "clustered": "qr1024_clustered_fast",
-            "nearrank": "qr1024_nearrank_fast",
-        }.get(case)
-    return None
+    return expected_case_route(spec)
+
+
+def allowed_routes(spec: dict[str, Any]) -> set[str] | None:
+    return allowed_family_routes(spec)
 
 
 def _synchronize(data: torch.Tensor) -> None:
@@ -179,9 +167,10 @@ def run_case(candidate, spec: dict[str, Any], include_plan: bool) -> dict[str, A
     (route, plan), route_wall_us, route_cuda_us = _timed(data, lambda: route_plan(candidate, data))
     plan = maybe_plan(candidate, data, spec, plan, include_plan)
 
+    candidate_allowed_routes = allowed_routes(spec)
     cuda_bypass = route in {"qr512_cuda_fast", "qr1024_cuda_fast"}
     classifier_ok = expected_class is None or cls == expected_class
-    route_ok = expected_candidate_route is None or route == expected_candidate_route or cuda_bypass
+    route_ok = candidate_allowed_routes is None or route in candidate_allowed_routes
 
     row: dict[str, Any] = {
         "ok": bool(classifier_ok and route_ok),
@@ -196,6 +185,7 @@ def run_case(candidate, spec: dict[str, Any], include_plan: bool) -> dict[str, A
         "classifier_ok": bool(classifier_ok),
         "route": route,
         "expected_route": expected_candidate_route,
+        "allowed_routes": sorted(candidate_allowed_routes) if candidate_allowed_routes is not None else None,
         "route_ok": bool(route_ok),
         "route_cuda_bypass": bool(cuda_bypass),
         "sampled_class_wall_us": class_wall_us,
